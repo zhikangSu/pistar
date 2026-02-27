@@ -54,6 +54,14 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 
+# ── Fix: 注册 'List' 为 'Sequence' 的别名 ──────────────────────────────
+# 某些版本的 lerobot 在写入 parquet 元数据时使用 _type="List"，
+# 而当前 datasets 版本只识别 "Sequence"，二者功能等价。
+from datasets.features.features import _FEATURE_TYPES, Sequence
+if "List" not in _FEATURE_TYPES:
+    _FEATURE_TYPES["List"] = Sequence
+# ────────────────────────────────────────────────────────────────────────
+
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np

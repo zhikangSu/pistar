@@ -53,6 +53,10 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
 import tyro
 
+from datasets.features.features import _FEATURE_TYPES, Sequence
+if "List" not in _FEATURE_TYPES:
+    _FEATURE_TYPES["List"] = Sequence
+
 
 def transform_reward(original_reward: float, is_terminal: bool, is_last: bool, episode_length: int) -> float:
     """
