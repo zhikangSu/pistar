@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.piper_policy as piper_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -343,6 +344,105 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
             outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        # One additional data transform: pi0 models are trained on delta actions (relative to the first
+        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
+        # you can uncomment the following line to convert the actions to delta actions. The only exception
+        # is for the gripper actions which are always absolute.
+        # In the example below, we would apply the delta conversion to the first 6 actions (joints) and
+        # leave the 7th action (gripper) unchanged, i.e. absolute.
+        # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
+        # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
+        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
+
+        # LIBERO already represents actions as deltas, but we have some old Pi0 checkpoints that are trained with this
+        # extra delta transform.
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory(adv_ind_dropout=self.adv_ind_dropout)(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotPiperDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
+    comments below.
+    """
+
+    extra_delta_transform: bool = False
+    adv_ind_dropout: bool = True # Set to True during training to apply adv_ind dropout in model transforms
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform is *only* applied to the data coming from the dataset,
+        # and *not* during inference. We can use it to make inputs from the dataset look
+        # as close as possible to those coming from the inference environment (e.g. match the keys).
+        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
+        # the keys we use in our inference pipeline (defined in the inference script for libero).
+        # For your own dataset, first figure out what keys your environment passes to the policy server
+        # and then modify the mappings below so your dataset's keys get matched to those target keys.
+        # The repack transform simply remaps key names here.
+        if not model_config.pistar:
+            repack_transform = _transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                    "cam_high": "image",
+                                    "cam_wrist": "wrist_image",
+                            },
+                            "state": "state",
+                            "actions": "actions",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            )
+        else:
+            repack_transform = _transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                    "cam_high": "image",
+                                    "cam_wrist": "wrist_image",
+                            },
+                            "state": "state",
+                            "actions": "actions",
+                            "prompt": "prompt",
+                            "adv_ind": "adv_ind", 
+                            # add adv_ind and filter out value, reward, epsilon, adv produced in pistar data processing
+                        }
+                    )
+                ]
+            )
+
+        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        # Below, we define the transforms for data going into the model (``inputs``) and the transforms
+        # for data coming out of the model (``outputs``) (the latter is only used during inference).
+        # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
+        # how to modify the transforms to match your dataset. Once you created your own transforms, you can
+        # replace the transforms below with your own.
+        data_transforms = _transforms.Group(
+            inputs=[piper_policy.PiperInputs()],
+            outputs=[piper_policy.PiperOutputs()],
         )
 
         # One additional data transform: pi0 models are trained on delta actions (relative to the first
@@ -785,20 +885,21 @@ _CONFIGS = [
         num_train_steps=30_000,
         keep_period=10_000,
     ),
-    # Pi05 model fine-tuning on local piper plug dataset config
+    # Pi05 model fine-tuning on local toy_33 dataset config
     TrainConfig(
-        name="pi05_piper_plug",
+        name="pi05_toy_33",
+        project_name="pistar",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=True),
-        data=LeRobotLiberoDataConfig(
-            repo_id="ybpy/piper_plug_task_teleop",
+        data=LeRobotPiperDataConfig(
+            repo_id="ybpy/toy_33",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=1_000,
             peak_lr=2e-4,
-            decay_steps=30_000,
+            decay_steps=8_000,
             decay_lr=2e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
@@ -806,16 +907,16 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/chenyuyao1/model/pi05_base/params"),
         # "gs://openpi-assets/checkpoints/pi05_base/params"
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-        keep_period=10_000,
+        num_train_steps=8_000,
+        keep_period=1_000,
     ),
-    # Pi05 model inference on local piper plug dataset config
+    # Pi05 model inference on local toy_33 dataset config
     TrainConfig(
-        name="pi05_piper_plug_infer",
+        name="pi05_toy_33_infer",
         project_name="pistar",
         model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=True),
-        data=LeRobotLiberoDataConfig(
-            repo_id="ybpy/piper_plug_task_teleop",
+        data=LeRobotPiperDataConfig(
+            repo_id="ybpy/toy_33",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
             adv_ind_dropout=False,
@@ -823,17 +924,17 @@ _CONFIGS = [
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=1_000,
             peak_lr=2e-4,
-            decay_steps=30_000,
+            decay_steps=8_000,
             decay_lr=2e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/chenyuyao1/model/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-        keep_period=10_000,
+        num_train_steps=8_000,
+        keep_period=1_000,
     ),
     # Pi05_star model fine-tuning on libero config
     TrainConfig(
@@ -885,37 +986,37 @@ _CONFIGS = [
         num_train_steps=30_000,
         keep_period=10_000,
     ),
-    # Pi05_star model fine-tuning on local piper plug dataset config
+    # Pi05_star model fine-tuning on local toy_33 dataset config
     TrainConfig(
-        name="pi05_star_piper_plug",
+        name="pi05_star_toy_33",
         project_name="pistar",
         model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=True),
-        data=LeRobotLiberoDataConfig(
-            repo_id="ybpy/piper_plug_pistar_all_positive",
+        data=LeRobotPiperDataConfig(
+            repo_id="ybpy/toy_33_pistar_all_positive",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=1_000,
             peak_lr=2e-4,
-            decay_steps=30_000,
+            decay_steps=8_000,
             decay_lr=2e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/chenyuyao1/model/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-        keep_period=10_000,
+        num_train_steps=8_000,
+        keep_period=1_000,
     ),
-    # Pi05_star model inference on local piper plug dataset config
+    # Pi05_star model inference on local toy_33 dataset config
     TrainConfig(
-        name="pi05_star_piper_plug_infer",
+        name="pi05_star_toy_33_infer",
         project_name="pistar",
         model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=True),
-        data=LeRobotLiberoDataConfig(
-            repo_id="ybpy/piper_plug_pistar_all_positive",
+        data=LeRobotPiperDataConfig(
+            repo_id="ybpy/toy_33_pistar_all_positive",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
             adv_ind_dropout=False,
@@ -923,9 +1024,9 @@ _CONFIGS = [
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=1_000,
             peak_lr=2e-4,
-            decay_steps=30_000,
+            decay_steps=8_000,
             decay_lr=2e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
