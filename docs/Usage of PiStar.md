@@ -77,9 +77,10 @@ python examples/libero/main.py --args.adv_ind_input positive
 # If you have egl errors, fix by running the following command
 sudo -E apt-get update
 sudo -E apt-get install -y libegl1 libgl1 libglvnd0 libgles2 libdrm2 libgbm1
-export MUJOCO_GL=glx
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
 python examples/libero/main.py --args.adv_ind_input positive
-# If failed, try following command
+# If failed, try the following command to use glx for rendering
 export MUJOCO_GL=glx
 xvfb-run -a python examples/libero/main.py --args.adv_ind_input positive
 ```
@@ -90,15 +91,16 @@ For rollout:
 # Recommend using egl for rendering
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
-python examples/libero/main.py --args.adv_ind_input positive --args.num_trials_per_task 5 --args.save_lerobot_rollouts --args.rollout_overwrite
+python examples/libero/main.py --args.adv_ind_input positive --args.num_trials_per_task 5 --args.save_lerobot_rollout --args.rollout_overwrite
 # If you have egl errors, fix by running the following command
 sudo -E apt-get update
 sudo -E apt-get install -y libegl1 libgl1 libglvnd0 libgles2 libdrm2 libgbm1
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+python examples/libero/main.py --args.adv_ind_input positive --args.num_trials_per_task 5 --args.save_lerobot_rollout --args.rollout_overwrite
+# If failed, try the following command to use glx for rendering
 export MUJOCO_GL=glx
-python examples/libero/main.py --args.adv_ind_input positive --args.num_trials_per_task 5 --args.save_lerobot_rollouts --args.rollout_overwrite
-# If failed, try following command
-export MUJOCO_GL=glx
-xvfb-run -a python examples/libero/main.py --args.adv_ind_input positive --args.num_trials_per_task 5 --args.save_lerobot_rollouts --args.rollout_overwrite
+xvfb-run -a python examples/libero/main.py --args.adv_ind_input positive --args.num_trials_per_task 5 --args.save_lerobot_rollout --args.rollout_overwrite
 ```
 
 ### 2. Server

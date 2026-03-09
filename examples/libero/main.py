@@ -53,7 +53,7 @@ class Args:
     #################################################################################################################
     # Optional LeRobot rollout export
     #################################################################################################################
-    save_lerobot_rollouts: bool = False  # Whether to save rollout trajectories as a LeRobot dataset
+    save_lerobot_rollout: bool = False  # Whether to save rollout trajectories as a LeRobot dataset
     rollout_repo_id: str = "ybpy/libero_rollouts"  # LeRobot repo id
     rollout_output_dir: Optional[str] = None  # Custom output dir; defaults to HF_LEROBOT_HOME
     rollout_overwrite: bool = False  # If True, remove existing dataset directory before writing
@@ -225,7 +225,7 @@ def eval_libero(args: Args) -> None:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
-    rollout_writer = LiberoRolloutLeRobotWriter(args) if args.save_lerobot_rollouts else None
+    rollout_writer = LiberoRolloutLeRobotWriter(args) if args.save_lerobot_rollout else None
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
