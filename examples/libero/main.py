@@ -1,3 +1,28 @@
+'''
+Usage:
+
+1) 不指定 task_ids：评估 suite 全任务
+python /public/home/chenyuyao1/code/pistar/examples/libero/main.py \
+  --args.task_suite_name libero_spatial \
+  --args.num_trials_per_task 50
+
+2) 指定 task_ids：仅评估 task 0, 3, 7
+python /public/home/chenyuyao1/code/pistar/examples/libero/main.py \
+  --args.task_suite_name libero_spatial \
+  --args.task_ids 0 3 7 \
+  --args.num_trials_per_task 10
+
+3) 指定 task_ids + 导出 LeRobot rollout
+python /public/home/chenyuyao1/code/pistar/examples/libero/main.py \
+  --args.task_suite_name libero_10 \
+  --args.task_ids 2 5 \
+  --args.save_lerobot_rollout true \
+  --args.rollout_output_dir /public/home/chenyuyao1/dataset/lerobot \
+  --args.rollout_repo_id ybpy/libero_rollouts_subset
+
+More args can be found in the Args dataclass.
+'''
+
 import collections
 import dataclasses
 import logging
@@ -38,6 +63,7 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    task_ids: Optional[list[int]] = None  # Specific task ids to evaluate and rollout (if None, evaluate all tasks in suite)
 
     #################################################################################################################
     # PI* specific parameters
@@ -54,7 +80,7 @@ class Args:
     # Optional LeRobot rollout export
     #################################################################################################################
     save_lerobot_rollout: bool = False  # Whether to save rollout trajectories as a LeRobot dataset
-    rollout_repo_id: str = "ybpy/libero_rollouts"  # LeRobot repo id
+    rollout_repo_id: str = "ybpy/libero_rollout"  # LeRobot repo id
     rollout_output_dir: Optional[str] = None  # Custom output dir; defaults to HF_LEROBOT_HOME
     rollout_overwrite: bool = False  # If True, remove existing dataset directory before writing
     rollout_robot_type: str = "panda"
@@ -229,7 +255,24 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    if args.task_ids is not None:
+        filtered_task_ids = [task_id for task_id in args.task_ids if 0 <= task_id < num_tasks_in_suite]
+        invalid_task_ids = [task_id for task_id in args.task_ids if task_id < 0 or task_id >= num_tasks_in_suite]
+        if invalid_task_ids:
+            logging.warning(
+                "Ignoring out-of-range task ids: %s (valid range: [0, %d))",
+                invalid_task_ids,
+                num_tasks_in_suite,
+            )
+        if not filtered_task_ids:
+            logging.error("No valid task ids left after filtering; nothing to evaluate.")
+            return
+        logging.info(f"Evaluating specified task ids: {filtered_task_ids}")
+        task_ids = filtered_task_ids
+    else:
+        logging.info("Evaluating all tasks in suite.")
+        task_ids = range(num_tasks_in_suite)
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
