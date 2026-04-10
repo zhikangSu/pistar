@@ -210,11 +210,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 scripts/train_wm.py
 We start from an initial observation sampled from the recorded trajectories and then generate long trajectories by replaying the recorded actions.
 
 ```bash
-python3 scripts/rollout_replay_traj.py --episode_id 99 --mode val
+python3 scripts/rollout_replay_traj.py --episode_id 99 
 # or
-python3 scripts/rollout_replay_traj.py \
-  --episode_id 0 \
-  --mode train \
-  --max_replay_steps 20
+python3 scripts/rollout_replay_traj.py --episode_ids 0,99,100
 ```
 

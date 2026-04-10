@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from argparse import ArgumentParser
 from pathlib import Path
 from typing import Optional
@@ -41,8 +42,8 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--dataset_cfgs", type=str, default=None)
     parser.add_argument("--replay_output_dir", type=str, default=None)
 
-    parser.add_argument("--mode", type=str, default=None)
-    parser.add_argument("--episode_id", type=int, required=True)
+    parser.add_argument("--episode_id", type=int, default=None)
+    parser.add_argument("--episode_ids", type=str, default=None)
     parser.add_argument("--start_frame", type=int, default=None)
     parser.add_argument("--max_replay_steps", type=int, default=None)
     parser.add_argument("--save_info", type=lambda x: str(x).lower() in {"1", "true", "t", "yes", "y"}, default=None)
@@ -277,27 +278,67 @@ def _load_episode(
     return ann, latents, pose, text, video_length
 
 
-def main(args):
-    mode = str(getattr(args, "mode", None) or "val")
-    start_frame = int(getattr(args, "start_frame", 0) if getattr(args, "start_frame", None) is not None else 0)
-    max_replay_steps = getattr(args, "max_replay_steps", None)
-    if max_replay_steps is not None:
-        max_replay_steps = int(max_replay_steps)
-        if max_replay_steps <= 0:
-            raise ValueError("max_replay_steps must be positive")
+def _resolve_episode_mode(dataset_root: Path, episode_id: int) -> str:
+    found = []
+    for mode in ("train", "val"):
+        ann_path = dataset_root / "annotation" / mode / f"{episode_id}.json"
+        if ann_path.exists():
+            found.append(mode)
 
-    dataset_names = [x for x in str(args.dataset_names).split("+") if x]
-    if len(dataset_names) == 0:
-        raise ValueError("dataset_names is empty")
-    dataset_name = dataset_names[0]
-    dataset_root = Path(args.dataset_root_path) / dataset_name
+    if len(found) == 0:
+        raise FileNotFoundError(
+            f"Episode {episode_id} not found in train/val: "
+            f"{dataset_root / 'annotation' / 'train' / f'{episode_id}.json'} or "
+            f"{dataset_root / 'annotation' / 'val' / f'{episode_id}.json'}"
+        )
+    if len(found) > 1:
+        raise ValueError(
+            f"Episode {episode_id} exists in multiple modes ({found}); expected disjoint train/val split."
+        )
+    return found[0]
 
-    episode_id = int(args.episode_id)
 
-    if len(getattr(args, "history_relative_offsets", [])) != int(args.num_history) - 1:
-        raise ValueError("history_relative_offsets length must equal num_history-1")
+def _parse_episode_ids(episode_id: Optional[int], episode_ids: Optional[str]) -> list[int]:
+    """Parse episode ids from --episode_id and --episode_ids.
 
-    agent = ReplayAgent(args)
+    --episode_ids supports comma/space separated ids, and ranges like 10-15.
+    """
+    values: list[int] = []
+
+    if episode_id is not None:
+        values.append(int(episode_id))
+
+    if episode_ids:
+        tokens = [t for t in re.split(r"[\s,]+", str(episode_ids).strip()) if t]
+        for tok in tokens:
+            if "-" in tok:
+                parts = tok.split("-", 1)
+                if len(parts) != 2 or not parts[0] or not parts[1]:
+                    raise ValueError(f"Invalid range token in --episode_ids: {tok}")
+                start = int(parts[0])
+                end = int(parts[1])
+                if end < start:
+                    raise ValueError(f"Invalid descending range in --episode_ids: {tok}")
+                values.extend(range(start, end + 1))
+            else:
+                values.append(int(tok))
+
+    deduped = list(dict.fromkeys(values))
+    if len(deduped) == 0:
+        raise ValueError("Please provide --episode_id or --episode_ids")
+    return deduped
+
+
+def _replay_single_episode(
+    args,
+    agent: ReplayAgent,
+    dataset_root: Path,
+    episode_id: int,
+    start_frame: int,
+    max_replay_steps: Optional[int],
+):
+    mode = _resolve_episode_mode(dataset_root, episode_id)
+
 
     _, gt_view_latents, gt_pose, text, video_length = _load_episode(dataset_root, mode, episode_id)
     if start_frame < 0 or start_frame >= video_length:
@@ -420,6 +461,40 @@ def main(args):
     logging.info("Saved replay video: %s", out_video)
     if bool(getattr(args, "save_info", True)):
         logging.info("Saved replay metadata: %s", out_json)
+
+
+def main(args):
+    start_frame = int(getattr(args, "start_frame", 0) if getattr(args, "start_frame", None) is not None else 0)
+    max_replay_steps = getattr(args, "max_replay_steps", None)
+    if max_replay_steps is not None:
+        max_replay_steps = int(max_replay_steps)
+        if max_replay_steps <= 0:
+            raise ValueError("max_replay_steps must be positive")
+
+    dataset_names = [x for x in str(args.dataset_names).split("+") if x]
+    if len(dataset_names) == 0:
+        raise ValueError("dataset_names is empty")
+    dataset_name = dataset_names[0]
+    dataset_root = Path(args.dataset_root_path) / dataset_name
+
+    episode_ids = _parse_episode_ids(getattr(args, "episode_id", None), getattr(args, "episode_ids", None))
+
+    if len(getattr(args, "history_relative_offsets", [])) != int(args.num_history) - 1:
+        raise ValueError("history_relative_offsets length must equal num_history-1")
+
+    agent = ReplayAgent(args)
+
+    logging.info("Will replay %d episode(s): %s", len(episode_ids), episode_ids)
+    for episode_id in episode_ids:
+        logging.info("Start replay for episode %d", int(episode_id))
+        _replay_single_episode(
+            args=args,
+            agent=agent,
+            dataset_root=dataset_root,
+            episode_id=int(episode_id),
+            start_frame=start_frame,
+            max_replay_steps=max_replay_steps,
+        )
 
 
 if __name__ == "__main__":
