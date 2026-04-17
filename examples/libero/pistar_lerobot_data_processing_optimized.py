@@ -330,21 +330,6 @@ def main(
             "shape": (1,),
             "names": ["reward"],
         },
-        "value": {
-            "dtype": "float32",
-            "shape": (1,),
-            "names": ["value"],
-        },
-        "adv": {
-            "dtype": "float32",
-            "shape": (1,),
-            "names": ["adv"],
-        },
-        "epsilon": {
-            "dtype": "float32",
-            "shape": (1,),
-            "names": ["epsilon"],
-        },
         "adv_ind": {
             "dtype": "string",
             "shape": (1,),
@@ -452,8 +437,11 @@ def main(
                     value = default_value
             else:
                 # 已经在前面计算过了
-                transformed_reward = rewards[step_idx]
-                value = values[step_idx]
+                original_reward = (
+                    float(frame[original_reward_key])
+                    if (original_reward_key and original_reward_key in frame)
+                    else (1.0 if step_idx == episode_length - 1 else 0.0)
+                )
             
             adv = advantages[step_idx]
             
@@ -470,10 +458,7 @@ def main(
             # 添加 task 和新的 PiStar 字段
             new_frame.update({
                 "task": task,
-                "reward": np.array([transformed_reward], dtype=np.float32),
-                "value": np.array([value], dtype=np.float32),
-                "adv": np.array([adv], dtype=np.float32),
-                "epsilon": np.array([epsilon], dtype=np.float32),
+                "reward": np.array([original_reward], dtype=np.float32),
                 "adv_ind": adv_ind,
             })
             

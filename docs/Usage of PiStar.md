@@ -172,7 +172,7 @@ For common libero dataset in lerobot format or rlds format are regenerated from 
    cd /path/to/pistar
    python examples/libero/wm_data_processing.py \
      --data_dir /path/to/your/LIBERO_no_noops_rlds \
-     --overwrite True
+     --overwrite
    ```
 
 Since the video diffusion model are run in latent space of image encoder, we need to extract the latent sapce of the video to improve training efficiency. You can run the following command to extract latent in parallel:

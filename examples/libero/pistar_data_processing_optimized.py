@@ -318,21 +318,6 @@ def main(
                 "shape": (1,),
                 "names": ["reward"],
             },
-            "value": {
-                "dtype": "float32",
-                "shape": (1,),
-                "names": ["value"],
-            },
-            "adv": {
-                "dtype": "float32",
-                "shape": (1,),
-                "names": ["adv"],
-            },
-            "epsilon": {
-                "dtype": "float32",
-                "shape": (1,),
-                "names": ["epsilon"],
-            },
             "adv_ind": {
                 "dtype": "string",
                 "shape": (1,),
@@ -417,10 +402,7 @@ def main(
                     "state": step['observation']['state'],
                     "actions": step['action'],
                     "task": task,
-                    "reward": np.array([transformed_reward], dtype=np.float32),
-                    "value": np.array([value], dtype=np.float32),
-                    "adv": np.array([adv], dtype=np.float32),
-                    "epsilon": np.array([epsilon], dtype=np.float32),
+                    "reward": np.array([original_reward], dtype=np.float32),
                     "adv_ind": adv_ind,
                 })
                 total_steps += 1
