@@ -178,10 +178,20 @@ class LiberoRolloutLeRobotWriter:
                     "shape": (1,),
                     "names": ["value_label"],
                 },
-                "reward":{
+                "reward": {
                     "dtype": "float32",
                     "shape": (1,),
                     "names": ["reward"],
+                },
+                "reward_label": {
+                    "dtype": "float32",
+                    "shape": (1,),
+                    "names": ["reward_label"],
+                },
+                "adv_ind": {
+                    "dtype": "string",
+                    "shape": (1,),
+                    "names": ["adv_ind"],
                 },
             },
             image_writer_threads=10,
@@ -205,7 +215,8 @@ class LiberoRolloutLeRobotWriter:
                 "intervention": np.asarray([0], dtype=np.int64),  # No manual intervention in LIBERO deployment
                 "value_label": np.asarray([value_labels[idx]], dtype=np.float32),
                 "reward": np.asarray([rewards[idx]], dtype=np.float32),
-                "reward_label": np.asarray([reward_labels[idx]], dtype=np.float32)
+                "reward_label": np.asarray([reward_labels[idx]], dtype=np.float32),
+                "adv_ind": "none",  # Advantage indicator will be inferenced using vlm later
             }
             self._add_frame(frame, task=task)
 
@@ -388,7 +399,7 @@ def eval_libero(args: Args) -> None:
                                 "wrist_image": np.ascontiguousarray(wrist_img_flipped),
                                 "state": np.asarray(obs_state, dtype=np.float32),
                                 "actions": np.asarray(action, dtype=np.float32),
-                                "abs_pose": np.asarray(np.concatenate((obs_state[:6], action[-1:]), axis=-1), dtype=np.float32),
+                                # "abs_pose": np.asarray(np.concatenate((obs_state[:6], action[-1:]), axis=-1), dtype=np.float32),
                             }
                         )
                     if done:
