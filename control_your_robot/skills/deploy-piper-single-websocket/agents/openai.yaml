@@ -1,0 +1,4 @@
+interface:
+  display_name: "Piper Websocket Deploy"
+  short_description: "Remote PI0/OpenPI websocket deployment for Piper"
+  default_prompt: "Use $deploy-piper-single-websocket to build or update a Piper single-arm remote inference deployment over websocket."

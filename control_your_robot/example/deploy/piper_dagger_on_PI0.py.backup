@@ -1,0 +1,334 @@
+"""
+DAgger deployment with rollout + intervention + data collection.
+
+Controls:
+  - Space: toggle autonomous/intervention
+  - Enter: start/stop episode
+"""
+import sys
+sys.path.append("./")
+
+import math
+import threading
+import time
+import select
+import tty
+import termios
+import numpy as np
+
+from my_robot.piper_dagger import PiperDAgger
+from robot.policy.openpi import PI0_SINGLE
+from robot.data.collect_lerobot_rl import CollectLeRobotRL
+
+joint_limits_rad = [
+    (math.radians(-150), math.radians(150)),
+    (math.radians(0), math.radians(180)),
+    (math.radians(-170), math.radians(0)),
+    (math.radians(-100), math.radians(100)),
+    (math.radians(-70), math.radians(70)),
+    (math.radians(-120), math.radians(120)),
+]
+gripper_limit = [(0.0, 1.0)]
+
+
+class InterventionController:
+    def __init__(self):
+        self.is_intervention = False
+        self.enter_pressed = False
+        self.lock = threading.Lock()
+        self.running = True
+        self.paused = False
+        self.old_settings = None
+
+    def toggle_intervention(self):
+        with self.lock:
+            self.is_intervention = not self.is_intervention
+            mode = "intervention" if self.is_intervention else "autonomous"
+            print(f"\n[mode] {mode}")
+
+    def set_intervention(self, enabled: bool):
+        with self.lock:
+            self.is_intervention = enabled
+
+    def get_state(self):
+        with self.lock:
+            return self.is_intervention
+
+    def is_enter_pressed(self):
+        with self.lock:
+            if self.enter_pressed:
+                self.enter_pressed = False
+                return True
+            return False
+
+    def pause_listener(self):
+        with self.lock:
+            self.paused = True
+
+    def resume_listener(self):
+        with self.lock:
+            self.paused = False
+
+    def _listen_keyboard(self):
+        while self.running:
+            with self.lock:
+                paused = self.paused
+            if paused:
+                time.sleep(0.05)
+                continue
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                char = sys.stdin.read(1)
+                if char == " ":
+                    self.toggle_intervention()
+                elif char == "\r" or char == "\n":
+                    with self.lock:
+                        self.enter_pressed = True
+                    print("\n[enter pressed]")
+            time.sleep(0.01)
+
+    def start_listener(self):
+        self.running = True
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        listener_thread = threading.Thread(target=self._listen_keyboard, daemon=True)
+        listener_thread.start()
+        print("keyboard listener started (space: toggle, enter: start/stop)")
+
+    def stop(self):
+        self.running = False
+        if self.old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
+
+class MirrorController:
+    def __init__(self, robot: PiperDAgger, intervention_ctrl: InterventionController, mirror_fps: int):
+        self.robot = robot
+        self.intervention_ctrl = intervention_ctrl
+        self.mirror_fps = mirror_fps
+        self.running = True
+        self.last_mode = None
+
+    def start(self):
+        thread = threading.Thread(target=self._run, daemon=True)
+        thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _apply_mode(self, is_intervention: bool):
+        if is_intervention:
+            self.robot.set_policy_enabled(False)
+            self.robot.hold_follower_position()
+            self.robot.enable_master_drag_mode()
+        else:
+            self.robot.set_policy_enabled(True)
+            self.robot.disable_master_drag_mode()
+
+    def _run(self):
+        period = 1.0 / max(1, self.mirror_fps)
+        while self.running:
+            try:
+                is_intervention = self.intervention_ctrl.get_state()
+                if is_intervention != self.last_mode:
+                    self._apply_mode(is_intervention)
+                    self.last_mode = is_intervention
+
+                # 只在自主模式下镜像从臂到主臂（观察用）
+                # 干预模式下的镜像由主循环控制，避免冲突
+                if not is_intervention:
+                    self.robot.mirror_follower_to_master()
+            except Exception as exc:
+                print(f"[mirror] error: {exc}")
+            time.sleep(period)
+
+
+def input_transform(data):
+    state_7d = np.concatenate([
+        np.array(data[0]["left_arm"]["joint"]).reshape(-1),
+        np.array(data[0]["left_arm"]["gripper"]).reshape(-1),
+    ])
+
+    img_head = data[1]["cam_head"]["color"]
+    img_wrist = data[1]["cam_wrist"]["color"]
+    img_arr = (img_head, img_wrist)
+
+    return img_arr, state_7d
+
+
+def output_transform(action):
+    def clamp(value, min_val, max_val):
+        return max(min_val, min(value, max_val))
+
+    action_7d = action[:7]
+    joints = [
+        clamp(action_7d[i], joint_limits_rad[i][0], joint_limits_rad[i][1])
+        for i in range(6)
+    ]
+    gripper = clamp(action_7d[6], gripper_limit[0][0], gripper_limit[0][1])
+
+    return {
+        "joint": joints,
+        "gripper": gripper,
+    }
+
+
+if __name__ == "__main__":
+    MODEL_PATH = "/app/checkpoint/25000"
+    TASK_NAME = "Plug the black plug into the three-hole socket"
+    TRAIN_CONFIG_NAME = "pi05_libero_local"
+    MAX_STEP = None  # 不限制最大步数，按 Enter 结束
+    NUM_EPISODE = 10
+
+    REPO_ID = "piper_plug_task_rl"
+    OUTPUT_DIR = "/app/dataset/rollout"
+    FPS = 10
+    MIRROR_FPS = 100  # Increased from 50 to 100 for smoother mirroring
+    PENALTY_VALUE = -1.0
+
+    print("=" * 60)
+    print("PI0 DAgger deployment")
+    print("=" * 60)
+    print(f"model: {MODEL_PATH}")
+    print(f"task: {TASK_NAME}")
+    print(f"train config: {TRAIN_CONFIG_NAME}")
+    print(f"dataset: {REPO_ID}")
+    print(f"output: {OUTPUT_DIR}")
+    print("=" * 60)
+
+    print("\n[1/4] init robot")
+    robot = PiperDAgger()
+    robot.set_up()
+    print("[ok] robot ready")
+
+    print("\n[2/4] load model")
+    model = PI0_SINGLE(TASK_NAME, TRAIN_CONFIG_NAME, "model", MODEL_PATH)
+    print("[ok] model loaded")
+
+    print("\n[3/4] init collector")
+    collector = CollectLeRobotRL(
+        repo_id=REPO_ID,
+        output_dir=OUTPUT_DIR,
+        task_name=TASK_NAME,
+        fps=FPS,
+        robot_type="piper",
+        state_dim=7,
+        action_dim=7,
+        image_size=(720, 1280),
+        camera_keys={
+            "cam_head": "image",
+            "cam_wrist": "wrist_image",
+        },
+        move_check=True,
+        tolerance=0.0001,
+        penalty_value=PENALTY_VALUE,
+    )
+    print("[ok] collector ready")
+
+    intervention_ctrl = InterventionController()
+    intervention_ctrl.start_listener()
+
+    mirror_ctrl = MirrorController(robot, intervention_ctrl, MIRROR_FPS)
+    mirror_ctrl.start()
+
+    print("\n[4/4] start episodes")
+    for episode_idx in range(NUM_EPISODE):
+        step = 0
+        print(f"\n=== Episode {episode_idx + 1}/{NUM_EPISODE} ===")
+
+        intervention_ctrl.set_intervention(False)
+        robot.reset()
+        model.reset_obsrvationwindows()
+        model.random_set_language()
+
+        print("press Enter to start")
+        is_start = False
+        while not is_start:
+            if intervention_ctrl.is_enter_pressed():
+                is_start = True
+                print("[ok] episode started")
+            else:
+                time.sleep(0.1)
+
+        last_time = time.time()
+        while is_start:  # 移除 MAX_STEP 限制，只通过 Enter 结束
+            data = robot.get()
+            is_intervention = intervention_ctrl.get_state()
+
+            img_arr, state = input_transform(data)
+            model.update_observation_window(img_arr, state)
+
+            if is_intervention:
+                # 干预模式：主循环直接控制镜像（不依赖 MirrorController 线程）
+                robot.mirror_master_to_follower()
+
+                follower_controller = {"left_arm": data[0]["left_arm"]}
+                collector.collect(follower_controller, data[1], is_intervention=True)
+                step += 1
+                if intervention_ctrl.is_enter_pressed():
+                    print("[warn] episode stop requested")
+                    is_start = False
+                current_time = time.time()
+                sleep_time = max(0, 1 / FPS - (current_time - last_time))
+                time.sleep(sleep_time)
+                last_time = time.time()
+                continue
+
+            action_chunk = model.get_action()
+            action_chunk = action_chunk[:20]
+            for action in action_chunk:
+                if intervention_ctrl.get_state():
+                    print("[warn] switched to intervention, stop policy actions")
+                    break
+                move_data = output_transform(action)
+                robot.move_follower(move_data)
+                data = robot.get()
+                follower_controller = {"left_arm": data[0]["left_arm"]}
+                collector.collect(follower_controller, data[1], is_intervention=False)
+                step += 1
+
+                current_time = time.time()
+                sleep_time = max(0, 1 / FPS - (current_time - last_time))
+                time.sleep(sleep_time)
+                last_time = time.time()
+
+                if intervention_ctrl.is_enter_pressed():
+                    print("[warn] episode stop requested")
+                    is_start = False
+                    break
+
+        print("=" * 60)
+        print(f"episode done (steps: {step}, frames: {len(collector.episode_buffer)})")
+        print("=" * 60)
+
+        # Ensure we exit intervention and stop mirroring commands to follower
+        intervention_ctrl.set_intervention(False)
+        try:
+            robot.hold_follower_position()
+            robot.disable_master_drag_mode()
+        except Exception as exc:
+            print(f"[warn] failed to exit intervention cleanly: {exc}")
+
+        if len(collector.episode_buffer) > 0:
+            print("label episode: 1=success, 0=failure")
+            intervention_ctrl.pause_listener()
+            success_input = input("enter 1/0: ").strip()
+            intervention_ctrl.resume_listener()
+            success = (success_input == "1")
+            collector.save_episode(success=success)
+            print(f"[ok] episode saved (success: {success})")
+        else:
+            print("[warn] empty episode, nothing saved")
+
+        # Reset both arms to follower mode and move to start position
+        print("[reset] resetting both arms to start position...")
+        robot.reset_to_follower_mode()
+        robot.reset()  # Move arms to start position
+        print("[ok] both arms reset complete")
+
+    mirror_ctrl.stop()
+    intervention_ctrl.stop()
+
+    print("\n" + "=" * 60)
+    print("all episodes finished")
+    print(f"dataset path: {collector.get_dataset_path()}")
+    print("=" * 60)

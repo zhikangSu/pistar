@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot"
+version = "1.0"
+description = "control_your_robot open source repo"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+dependencies = [
+    "tqdm",
+    "scipy",
+    "numpy",
+    "h5py",
+    "pyrealsense2",
+    "opencv-python",
+    "keyboard",
+    "pyyaml",
+    "seaborn",
+    "seaborn",
+]
+
+[project.urls]
+Repository = "https://github.com/Tian-Nian/control_your_robot"
+
+# ⭐ 关键配置：告诉 setuptools，包在 src/ 下面
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# 你原来就有的
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.pytest.ini_options]
+markers = ["manual: should be run manually."]
+testpaths = ["src", "scripts"]
