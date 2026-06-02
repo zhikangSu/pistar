@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.piper_policy as piper_policy
+import openpi.policies.realman_teleop_policy as realman_teleop_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -284,6 +285,58 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotRealmanUnlockDataConfig(DataConfigFactory):
+    """Data config for RealMan unlock data.
+
+    The dataset follows the PiStar toy/white_plug style fields, but uses RealMan
+    dual-arm state/actions and camera keys `image` + `left_wrist_image`.
+    """
+
+    use_delta_joint_actions: bool = False
+    default_prompt: str | None = None
+    adapt_to_pi: bool = False
+    adv_ind_dropout: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure = {
+            "images": {
+                "cam_high": "image",
+                "cam_left_wrist": "left_wrist_image",
+            },
+            "state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if model_config.pistar:
+            repack_structure["adv_ind"] = "adv_ind"
+
+        data_transforms = _transforms.Group(
+            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(
+            default_prompt=self.default_prompt,
+            adv_ind_dropout=self.adv_ind_dropout,
+        )(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)]),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("actions",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
     """
     This config is used to configure transforms that are applied at various parts of the data pipeline.
@@ -542,6 +595,73 @@ class RLDSDroidDataConfig(DataConfigFactory):
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
             datasets=self.datasets,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRealmanTeleopDataConfig(DataConfigFactory):
+    """Data config for RealMan dual-arm teleop LeRobot datasets.
+
+    Expected LeRobot frame keys:
+    state, actions, timestamp, frame_index, episode_index, index, task_index.
+
+    Camera keys are configurable because the current RealMan datasets do not
+    always have the same camera set:
+    - realman/press5buttons: image + right_wrist_image
+    - realman/rotate: right_wrist_image only
+
+    Missing model camera slots should be mapped to an existing source camera in
+    the TrainConfig. This keeps the downstream pi0.5/PiStar image interface
+    unchanged: base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb.
+    """
+
+    default_prompt: str | None = None
+    use_delta_joint_actions: bool = False
+    adv_ind_dropout: bool = True
+    cam_high_key: str = "image"
+    cam_left_wrist_key: str = "left_wrist_image"
+    cam_right_wrist_key: str = "right_wrist_image"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure = {
+            "images": {
+                "cam_high": self.cam_high_key,
+                "cam_left_wrist": self.cam_left_wrist_key,
+                "cam_right_wrist": self.cam_right_wrist_key,
+            },
+            "state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if model_config.pistar:
+            repack_structure["adv_ind"] = "adv_ind"
+
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
+
+        data_transforms = _transforms.Group(
+            inputs=[realman_teleop_policy.RealmanTeleopInputs()],
+            outputs=[realman_teleop_policy.RealmanTeleopOutputs()],
+        )
+
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(
+            default_prompt=self.default_prompt,
+            adv_ind_dropout=self.adv_ind_dropout,
+        )(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("actions",),
         )
 
 
@@ -986,6 +1106,59 @@ _CONFIGS = [
         num_train_steps=30_000,
         keep_period=10_000,
     ),
+    # Pi05_star model fine-tuning on local toy dataset config
+    TrainConfig(
+        name="pi05_star_toy",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="vlm_data/toy_419_419r1_r2_r3",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=64,
+        fsdp_devices=2,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/wangsenbao_it/litianheng/pistar/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+        keep_period=1000,
+    ),
+    # Pi05_star model inference on local toy dataset config
+    TrainConfig(
+        name="pi05_star_toy_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="toy_330_330r1_330r2_and_409r",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            adv_ind_dropout=False,
+            # Disable adv_ind dropout during inference
+        ),
+        batch_size=64,
+        fsdp_devices=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/chenyuyao1/model/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=2_0000,
+        keep_period=1_000,
+    ),
     # Pi05_star model fine-tuning on local toy_33 dataset config
     TrainConfig(
         name="pi05_star_toy_33",
@@ -1034,6 +1207,231 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/chenyuyao1/model/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=8_000,
+        keep_period=1_000,
+    ),
+    # Pi05_star model fine-tuning on local white_plug dataset config
+    TrainConfig(
+        name="pi05_star_white_plug",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="vlm_data/white_426_100_r1_r3_r3new",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=64,
+        fsdp_devices=2,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/wangsenbao_it/litianheng/pistar/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+        keep_period=1000,
+    ),
+    # Pi05_star model inference on local white_plug dataset config
+    TrainConfig(
+        name="pi05_star_white_plug_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="white_plug_416_all_positive",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            adv_ind_dropout=False,
+            # Disable adv_ind dropout during inference
+        ),
+        batch_size=32,
+        fsdp_devices=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-4,
+            decay_steps=10_000,
+            decay_lr=2e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/chenyuyao1/model/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=8_000,
+        keep_period=1_000,
+    ),
+    TrainConfig(
+        name="pi05_star_realman_unlock",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotRealmanUnlockDataConfig(
+            repo_id="realman_unlock",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        batch_size=64,
+        fsdp_devices=2,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/wangsenbao_it/litianheng/pistar/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=10_000,
+        keep_period=1000,
+    ),
+    TrainConfig(
+        name="pi05_star_realman_unlock_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotRealmanUnlockDataConfig(
+            repo_id="realman_unlock",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            adv_ind_dropout=False,
+        ),
+        batch_size=64,
+        fsdp_devices=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/chenyuyao1/model/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=2_0000,
+        keep_period=1_000,
+    ),
+    TrainConfig(
+        name="pi05_star_realman_press5buttons",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotRealmanTeleopDataConfig(
+            repo_id="realman/press5buttons",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            cam_high_key="image",
+            cam_left_wrist_key="right_wrist_image",
+            cam_right_wrist_key="right_wrist_image",
+        ),
+        batch_size=64,
+        fsdp_devices=2,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/public/home/wangsenbao_it/litianheng/pistar/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=10_000,
+        keep_period=1_000,
+    ),
+    TrainConfig(
+        name="pi05_star_realman_press5buttons_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotRealmanTeleopDataConfig(
+            repo_id="realman/press5buttons",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            adv_ind_dropout=False,
+            cam_high_key="image",
+            cam_left_wrist_key="right_wrist_image",
+            cam_right_wrist_key="right_wrist_image",
+        ),
+        batch_size=64,
+        fsdp_devices=2,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/public/home/wangsenbao_it/litianheng/pistar/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=10_000,
+        keep_period=1_000,
+    ),
+    TrainConfig(
+        name="pi05_star_realman_rotate",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotRealmanTeleopDataConfig(
+            repo_id="realman/rotate",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            cam_high_key="right_wrist_image",
+            cam_left_wrist_key="right_wrist_image",
+            cam_right_wrist_key="right_wrist_image",
+        ),
+        batch_size=64,
+        fsdp_devices=2,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/public/home/wangsenbao_it/litianheng/pistar/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=10_000,
+        keep_period=1_000,
+    ),
+    TrainConfig(
+        name="pi05_star_realman_rotate_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotRealmanTeleopDataConfig(
+            repo_id="realman/rotate",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            adv_ind_dropout=False,
+            cam_high_key="right_wrist_image",
+            cam_left_wrist_key="right_wrist_image",
+            cam_right_wrist_key="right_wrist_image",
+        ),
+        batch_size=64,
+        fsdp_devices=2,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/public/home/wangsenbao_it/litianheng/pistar/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=10_000,
         keep_period=1_000,
     ),
     #
