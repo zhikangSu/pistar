@@ -223,9 +223,7 @@ The VLM value model takes image observations and task text as input and outputs 
 
 ### 1. Train the VLM value model
 
-VLM base weights download link:
-
-- [AliPan: VLM base weights](https://www.alipan.com/s/h31AF5CBWwA)
+The VLM base checkpoint weights are available from two sources: [ybpy/vlm_ckpt · Hugging Face](https://huggingface.co/ybpy/vlm_ckpt) and [Google Drive](https://drive.google.com/drive/folders/1pS6J82pvEwqUJt16n1uKKFm_MmyyKuuu?usp=drive_link). You may download the checkpoint from either source as you like before running training or inference.
 
 After downloading, place the base weights and `tokenizer.model` somewhere accessible from the training machine. During training, `--load_pretrained` loads the base weights; `--tokenizer_path` needs to point to the local Gemma tokenizer file.
 
