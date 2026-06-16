@@ -3,39 +3,257 @@ import logging
 import os
 import pathlib
 import re
+import sys
+from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
+import flax
 import flax.traverse_util
 import numpy as np
 
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.download as download
+from openpi.shared import console
 
 logger = logging.getLogger(__name__)
 
-# Upstream (ybpy/pistar) Gemma checkpoint converter: turns the Google base Gemma
-# orbax tree (FLAT ``transformer/...``) into the nested ``{embedder, layer_*,
-# final_norm}`` structure and unwraps einsum ``/w`` via gemma's param_remapper.
+_BV_PATH = os.path.join(os.path.dirname(__file__), "../../../big_vision")
+if _BV_PATH not in sys.path:
+    sys.path.insert(0, _BV_PATH)
 try:
-    from gemma.gm.ckpts import _checkpoint as _gm_ckpt  # type: ignore
-except Exception:  # pragma: no cover - optional / env-dependent
-    _gm_ckpt = None
+    from big_vision import utils as bv_utils  # type: ignore
+    from big_vision.models import vit as bv_vit  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    bv_utils = None
+    bv_vit = None
+
+try:
+    from gemma.gm import ckpts as gm_ckpts  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    gm_ckpts = None
+
+try:
+    from gemma.gm.ckpts import _checkpoint as gm_ckpt  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    gm_ckpt = None
 
 
-def _maybe_convert_gemma_ckpt_tree(tree):
-    """Convert a restored Gemma checkpoint tree to nested format (upstream helper).
-
-    Returns the nested tree on success, or ``None`` if the gemma library converter
-    is unavailable / fails (caller then falls back to a direct prefix mapping).
-    """
-    if _gm_ckpt is None:
-        return None
+def _flatten_keys(tree: at.Params) -> set[str]:
     try:
-        return _gm_ckpt._CheckpointTree(tree=tree).nested_tree
+        flat = flax.traverse_util.flatten_dict(tree, sep="/")
+    except Exception:
+        return set()
+    return set(flat.keys())
+
+
+def _summarize_param_match(name: str, loaded_params: at.Params, ref_params: at.Params) -> None:
+    """Log a short compatibility summary between loaded params and reference params."""
+    try:
+        flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+        flat_ref = flax.traverse_util.flatten_dict(ref_params, sep="/")
     except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Gemma ckpt convert via gemma lib failed (%s); using fallback mapping", exc)
-        return None
+        logger.warning(console.warn(f"{name} params: failed to flatten for comparison ({exc})"))
+        return
+
+    loaded_keys = set(flat_loaded.keys())
+    ref_keys = set(flat_ref.keys())
+    overlap = loaded_keys & ref_keys
+    missing = ref_keys - loaded_keys
+    extra = loaded_keys - ref_keys
+
+    shape_mismatch = []
+    for k in overlap:
+        lv = flat_loaded.get(k)
+        rv = flat_ref.get(k)
+        if hasattr(lv, "shape") and hasattr(rv, "shape") and lv.shape != rv.shape:
+            shape_mismatch.append(k)
+
+    logger.info(
+        console.info(
+            f"{name} params: matched {len(overlap)}/{len(ref_keys)} "
+            f"(missing {len(missing)}, extra {len(extra)}, shape_mismatch {len(shape_mismatch)})"
+        )
+    )
+    if missing:
+        sample = list(sorted(missing))[:10]
+        logger.warning(console.warn(f"{name} missing keys (sample): {sample}"))
+    if shape_mismatch:
+        sample = list(sorted(shape_mismatch))[:10]
+        logger.warning(console.warn(f"{name} shape mismatch keys (sample): {sample}"))
+
+
+def _select_subtree_by_overlap(loaded_params: at.Params, ref_params: at.Params, name: str) -> at.Params:
+    """Select a nested subtree with best key overlap against ref params."""
+    if not isinstance(loaded_params, Mapping):
+        return loaded_params
+    ref_keys = _flatten_keys(ref_params)
+    if not ref_keys:
+        return loaded_params
+
+    def _overlap(p: at.Params) -> int:
+        return len(_flatten_keys(p) & ref_keys)
+
+    current = loaded_params
+    current_score = _overlap(current)
+    improved = True
+    while improved and isinstance(current, Mapping):
+        improved = False
+        best_key = None
+        best_params = None
+        best_score = current_score
+        for k, v in current.items():
+            if isinstance(v, Mapping):
+                score = _overlap(v)
+                if score > best_score:
+                    best_score = score
+                    best_key = k
+                    best_params = v
+        if best_params is not None:
+            logger.info(console.info(f"{name} params: selecting '{best_key}' subtree (overlap={best_score})"))
+            current = best_params
+            current_score = best_score
+            improved = True
+    return current
+
+
+def _maybe_resample_siglip_posemb(siglip_params: at.Params, ref_params: at.Params) -> at.Params:
+    """Resample SigLIP position embedding to match reference shape when needed."""
+    if bv_vit is None:
+        return siglip_params
+    if not isinstance(siglip_params, Mapping) or not isinstance(ref_params, Mapping):
+        return siglip_params
+
+    def _get_posemb(p: Mapping):
+        if "pos_embedding" in p:
+            return ("pos_embedding", p["pos_embedding"])
+        if "Transformer" in p and isinstance(p["Transformer"], Mapping) and "pos_embedding" in p["Transformer"]:
+            return ("Transformer/pos_embedding", p["Transformer"]["pos_embedding"])
+        return (None, None)
+
+    src_key, src = _get_posemb(siglip_params)
+    dst_key, dst = _get_posemb(ref_params)
+    if src_key is None or dst_key is None:
+        return siglip_params
+    if not hasattr(src, "shape") or not hasattr(dst, "shape") or src.shape == dst.shape:
+        return siglip_params
+
+    try:
+        resized = bv_vit.resample_posemb(src, dst)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(console.warn(f"SigLIP pos_embedding resize failed: {exc}"))
+        return siglip_params
+
+    if src_key == "pos_embedding":
+        siglip_params = dict(siglip_params)
+        siglip_params["pos_embedding"] = resized
+        return siglip_params
+
+    # Transformer/pos_embedding
+    siglip_params = dict(siglip_params)
+    transformer = siglip_params.get("Transformer")
+    if isinstance(transformer, Mapping):
+        transformer = dict(transformer)
+        transformer["pos_embedding"] = resized
+        siglip_params["Transformer"] = transformer
+    return siglip_params
+
+
+def _maybe_convert_gemma_ckpt_tree(tree: at.Params) -> at.Params:
+    """Convert Gemma checkpoint tree to nested format if needed."""
+    if gm_ckpt is None:
+        return tree
+    try:
+        ckpt_tree = gm_ckpt._CheckpointTree(tree=tree)
+        return ckpt_tree.nested_tree
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(console.warn(f"Gemma checkpoint convert failed: {exc}"))
+        return tree
+
+
+def _select_siglip_image_params(siglip_params: at.Params, ref_params: at.Params) -> at.Params:
+    """Select the SigLIP image tower params from a checkpoint tree."""
+    if not isinstance(siglip_params, Mapping):
+        return siglip_params
+
+    img_ref_keys = {k[len("img/") :] for k in _flatten_keys(ref_params) if k.startswith("img/")}
+
+    candidates: list[tuple[str, at.Params]] = [("root", siglip_params)]
+    for key in ("img", "image", "vision", "visual", "image_encoder", "vision_encoder", "params"):
+        if key in siglip_params and isinstance(siglip_params[key], Mapping):
+            candidates.append((key, siglip_params[key]))
+    if len(siglip_params) == 1:
+        only_key = next(iter(siglip_params))
+        only_val = siglip_params[only_key]
+        if isinstance(only_val, Mapping):
+            candidates.append((only_key, only_val))
+
+    if not img_ref_keys:
+        for name, cand in candidates:
+            if name == "img":
+                logger.info(console.info("SigLIP image params: fallback to 'img' subtree"))
+                return cand
+        return siglip_params
+
+    best_overlap = -1
+    best_name = "root"
+    best_params = siglip_params
+    for name, cand in candidates:
+        overlap = len(_flatten_keys(cand) & img_ref_keys)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_name = name
+            best_params = cand
+
+    if best_name != "root":
+        logger.info(console.info(f"SigLIP image params: using '{best_name}' subtree (overlap={best_overlap})"))
+    return best_params
+
+
+def _stack_params(blocks: list[at.Params]) -> at.Params:
+    if not blocks:
+        return {}
+    first = blocks[0]
+    if isinstance(first, Mapping):
+        common_keys = set(first.keys())
+        for b in blocks[1:]:
+            if isinstance(b, Mapping):
+                common_keys &= set(b.keys())
+            else:
+                return first
+        if common_keys != set(first.keys()):
+            logger.warning(console.warn("SigLIP encoderblock keys mismatch across layers; dropping non-common keys"))
+        return {k: _stack_params([b[k] for b in blocks]) for k in sorted(common_keys)}
+    return np.stack(blocks, axis=0)
+
+
+def _maybe_convert_siglip_to_scan(siglip_params: at.Params) -> at.Params:
+    """Convert unscanned SigLIP encoderblock_* params to scanned encoderblock."""
+    if not isinstance(siglip_params, Mapping):
+        return siglip_params
+    transformer = siglip_params.get("Transformer")
+    if not isinstance(transformer, Mapping):
+        return siglip_params
+    if "encoderblock" in transformer:
+        return siglip_params
+
+    block_keys = [k for k in transformer.keys() if re.fullmatch(r"encoderblock_\\d+", k)]
+    if not block_keys:
+        return siglip_params
+
+    block_keys.sort(key=lambda k: int(k.split("_")[1]))
+    blocks = [transformer[k] for k in block_keys]
+    stacked = _stack_params(blocks)
+
+    new_transformer = dict(transformer)
+    for k in block_keys:
+        new_transformer.pop(k, None)
+    new_transformer["encoderblock"] = stacked
+
+    new_params = dict(siglip_params)
+    new_params["Transformer"] = new_transformer
+    logger.info(console.info(f"SigLIP params: converted {len(block_keys)} encoder blocks to scanned format"))
+    return new_params
 
 
 @runtime_checkable
@@ -76,29 +294,117 @@ class CheckpointWeightLoader(WeightLoader):
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
         # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*", log_prefix="Checkpoint")
+
+
+
+
+def _vlm_ckpt_root() -> pathlib.Path:
+    """Resolve the local VLM (SigLIP + Gemma) checkpoint dir for ValueModelWeightLoader.
+
+    Defaults to <repo_root>/assets/vlm_ckpt (works on both laptop and server since the
+    weights are staged there); override with the PISTAR_VLM_CKPT env var. Replaces the
+    upstream hardcoded author-cluster absolute paths.
+    """
+    override = os.environ.get("PISTAR_VLM_CKPT")
+    if override:
+        return pathlib.Path(override)
+    return pathlib.Path(__file__).resolve().parents[3] / "assets" / "vlm_ckpt"
 
 
 @dataclasses.dataclass(frozen=True)
-class PaliGemmaWeightLoader(WeightLoader):
-    """Loads weights from the official PaliGemma checkpoint.
+class ValueModelWeightLoader(WeightLoader):
+    """加载 SigLIP 和 Gemma 3 270M 预训练权重用于 ValueModel。
 
-    This will overwrite existing weights with similar names while keeping all extra weights intact.
-    This allows us to support the action expert which is used by the Pi0 model.
+    - SigLIP: 
+    - Gemma 3 270M: 
+    - ValueHead: 随机初始化
     """
 
+    gemma_variant: str = "gemma3-270m"
+
     def load(self, params: at.Params) -> at.Params:
-        path = download.maybe_download(
-            "gs://vertex-model-garden-paligemma-us/paligemma/pt_224.npz", gs={"token": "anon"}
+        logger.info(console.info("加载 SigLIP 权重 (from local checkpoint)..."))
+        siglip_path = str(_vlm_ckpt_root() / "siglip2-so400m-patch14-224-jax" / "siglip2_so400m14_224.npz")
+        siglip_params = None
+        if bv_utils is not None:
+            try:
+                siglip_params = bv_utils.load_params(f"{siglip_path}:img")
+                logger.info(console.info("SigLIP params loaded via big_vision.utils.load_params(:img)"))
+            except Exception as e:
+                logger.warning(console.warn(f"SigLIP load via big_vision.utils failed: {e}; fallback to np.load"))
+                siglip_params = None
+        if siglip_params is None:
+            with open(siglip_path, "rb") as f:
+                siglip_flat = dict(np.load(f, allow_pickle=False))
+            siglip_tree = flax.traverse_util.unflatten_dict(siglip_flat, sep="/")
+            siglip_params = siglip_tree["params"] if "params" in siglip_tree else siglip_tree
+        if isinstance(siglip_params, flax.core.FrozenDict):
+            siglip_params = flax.core.unfreeze(siglip_params)
+        siglip_params = _select_siglip_image_params(siglip_params, params)
+        siglip_params = _maybe_convert_siglip_to_scan(siglip_params)
+        if isinstance(params, Mapping) and "img" in params:
+            siglip_params = _maybe_resample_siglip_posemb(siglip_params, params["img"])
+        if isinstance(params, Mapping) and "img" in params:
+            _summarize_param_match("SigLIP", siglip_params, params["img"])
+
+        logger.info(console.info("加载 Gemma 3 270M 权重 (from local Orbax checkpoint)..."))
+        gemma_checkpoint_dir = str(_vlm_ckpt_root() / "gemma-3-270m")
+
+        # 使用 Gemma 官方 ckpts loader（优先），必要时回退 Orbax
+        try:
+            gemma_params = None
+            if gm_ckpts is not None and isinstance(params, Mapping) and "llm" in params:
+                try:
+                    gemma_params = gm_ckpts.load_params(
+                        gemma_checkpoint_dir,
+                        params=params["llm"],
+                        donate=False,
+                    )
+                    logger.info(console.info("Gemma params loaded via gemma.gm.ckpts.load_params"))
+                except Exception as e:
+                    logger.warning(console.warn(f"Gemma ckpts loader failed: {e}; fallback to Orbax"))
+                    gemma_params = None
+
+            if gemma_params is None:
+                from orbax.checkpoint import PyTreeCheckpointer
+
+                checkpointer = PyTreeCheckpointer()
+                gemma_params = checkpointer.restore(gemma_checkpoint_dir)
+                if isinstance(gemma_params, flax.core.FrozenDict):
+                    gemma_params = flax.core.unfreeze(gemma_params)
+                gemma_params = _maybe_convert_gemma_ckpt_tree(gemma_params)
+                # 兼容不同checkpoint结构：先尝试挑选与参考参数匹配度最高的子树
+                if isinstance(params, Mapping) and "llm" in params:
+                    gemma_params = _select_subtree_by_overlap(gemma_params, params["llm"], "Gemma")
+            logger.info(console.ok("成功加载 Gemma checkpoint"))
+        except Exception as e:
+            logger.error(console.error(f"Gemma 加载失败: {e}"))
+            raise
+        if isinstance(params, Mapping) and "llm" in params:
+            _summarize_param_match("Gemma", gemma_params, params["llm"])
+
+        loaded_params = {
+            "img": siglip_params,
+            "llm": gemma_params,
+        }
+
+        # 匹配 value_head, img_projection, cross_attention, cross_attn_norm
+        return _merge_params(
+            loaded_params,
+            params,
+            missing_regex=".*(value_head|img_projection|cross_att).*",
+            log_prefix="ValueModel",
         )
-        with path.open("rb") as f:
-            flat_params = dict(np.load(f, allow_pickle=False))
-        loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
-        # Add all missing weights.
-        return _merge_params(loaded_params, params, missing_regex=".*")
 
 
-def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
+def _merge_params(
+    loaded_params: at.Params,
+    params: at.Params,
+    *,
+    missing_regex: str,
+    log_prefix: str | None = None,
+) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
     Args:
@@ -114,228 +420,59 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
 
     # First, take all weights that are a subset of the reference weights.
     result = {}
+    loaded_keys = set()
+    shape_mismatch = []
+    dtype_cast = 0
     for k, v in flat_loaded.items():
         if k in flat_ref:
-            result[k] = v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
+            loaded_keys.add(k)
+            ref_v = flat_ref[k]
+            if hasattr(v, "shape") and hasattr(ref_v, "shape") and v.shape != ref_v.shape:
+                shape_mismatch.append((k, getattr(v, "shape", None), getattr(ref_v, "shape", None)))
+                continue
+            if v.dtype != ref_v.dtype:
+                dtype_cast += 1
+                result[k] = v.astype(ref_v.dtype)
+            else:
+                result[k] = v
 
     flat_loaded.clear()
 
     # Then, merge any missing weights as defined by the missing regex.
     pattern = re.compile(missing_regex)
-    for k in {k for k in flat_ref if pattern.fullmatch(k)}:
+    allowed_missing = {k for k in flat_ref if pattern.fullmatch(k)}
+    for k in allowed_missing:
         if k not in result:
             result[k] = flat_ref[k]
 
-    return flax.traverse_util.unflatten_dict(result, sep="/")
-
-
-def _repo_root() -> pathlib.Path:
-    # weight_loaders.py lives at <repo>/src/openpi/training/weight_loaders.py
-    return pathlib.Path(__file__).resolve().parents[3]
-
-
-@dataclasses.dataclass(frozen=True)
-class ValueModelWeightLoader(WeightLoader):
-    """Loads pretrained VLM backbone weights into a ``ValueModel`` parameter tree.
-
-    The ``ValueModel`` (see ``openpi.models.value_model``) combines a SigLIP vision
-    tower (top-level ``img`` subtree) and a Gemma3-270M language model (top-level
-    ``llm`` subtree) with value-function specific layers (``img_projection``,
-    ``cross_attention``, ``cross_attn_norm``, ``value_head``). With the default
-    ``freeze_mode=all_backbones`` the ``img`` and ``llm`` backbones are frozen, so
-    they MUST be initialised from pretrained weights -- otherwise the frozen
-    backbone stays random and the value model cannot learn anything useful.
-
-    This loader replaces ONLY the two backbones and leaves every other parameter
-    (i.e. the value-function specific layers) at its random init value:
-
-      * ``img``  <- big_vision SigLIP npz, keys ``params/img/*``
-                    (``<vlm_ckpt>/siglip2-so400m-patch14-224-jax/siglip2_so400m14_224.npz``)
-      * ``llm``  <- Gemma3-270M orbax checkpoint, ``params/llm/*`` subtree
-                    (``<vlm_ckpt>/gemma-3-270m/step_*``)
-
-    The checkpoint root defaults to ``<repo>/assets/vlm_ckpt`` and can be overridden
-    via the ``vlm_ckpt_dir`` argument or the ``OPENPI_VLM_CKPT_DIR`` environment
-    variable.
-
-    Shapes are validated per-leaf; a shape mismatch or a backbone leaf that cannot
-    be filled from the source raises an error (no silent mis-loading). Source keys
-    that do not correspond to a model parameter (e.g. the SigLIP ``MAPHead`` /
-    text-tower, or the extra ValueModel layers stored in the Gemma checkpoint) are
-    reported as a warning.
-    """
-
-    vlm_ckpt_dir: str | None = None
-    siglip_npz_relpath: str = "siglip2-so400m-patch14-224-jax/siglip2_so400m14_224.npz"
-    gemma_ckpt_relpath: str = "gemma-3-270m"
-
-    def _resolve_root(self) -> pathlib.Path:
-        root = self.vlm_ckpt_dir or os.getenv("OPENPI_VLM_CKPT_DIR")
-        if root:
-            path = pathlib.Path(root).expanduser()
-        else:
-            path = _repo_root() / "assets" / "vlm_ckpt"
-        if not path.exists():
-            raise FileNotFoundError(
-                f"vlm_ckpt directory not found: {path}. Set vlm_ckpt_dir or OPENPI_VLM_CKPT_DIR."
+    # Logging: coverage, missing, extras, shape mismatches.
+    if log_prefix is None:
+        log_prefix = "Weights"
+    missing = set(flat_ref.keys()) - set(result.keys())
+    unexpected = loaded_keys - set(flat_ref.keys())
+    if missing:
+        # Only show a small sample to avoid log spam.
+        sample = sorted(missing)[:10]
+        logger.warning(
+            console.warn(
+                f"{log_prefix} missing keys: {len(missing)} (sample: {sample})"
             )
-        return path
-
-    def _load_siglip_img(self, root: pathlib.Path) -> dict[str, np.ndarray]:
-        npz_path = root / self.siglip_npz_relpath
-        if not npz_path.exists():
-            raise FileNotFoundError(f"SigLIP npz not found: {npz_path}")
-        prefix = "params/img/"
-        out: dict[str, np.ndarray] = {}
-        # NpzFile is lazy: only the img-tower arrays are realised (the text tower is skipped).
-        with np.load(npz_path, allow_pickle=False) as npz:
-            for key in npz.files:
-                if key.startswith(prefix):
-                    out["img/" + key[len(prefix):]] = np.asarray(npz[key])
-        if not out:
-            raise ValueError(f"No 'params/img/*' keys found in SigLIP npz: {npz_path}")
-        return out
-
-    def _resolve_gemma_ckpt(self, root: pathlib.Path) -> pathlib.Path:
-        base = root / self.gemma_ckpt_relpath
-        if not base.exists():
-            raise FileNotFoundError(f"Gemma checkpoint dir not found: {base}")
-        # The top-level dir IS the Google base Gemma3-270M orbax checkpoint
-        # (FLAT layout: ``transformer/{embedder,layer_*,final_norm}``, bfloat16).
-        # Do NOT descend into any ``step_*`` sub-dir -- that is a separate (ValueModel
-        # training) artifact and would load value-tuned, not base, Gemma weights.
-        return base
-
-    @staticmethod
-    def _gemma_flat_to_llm(flat: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Map flattened Gemma checkpoint leaves to the model's ``llm/*`` keys.
-
-        Detects the Gemma subtree prefix and re-roots it under ``llm/``. Handles:
-          * Google base Gemma orbax: leaves ``transformer/{embedder,layer_*,final_norm}/...``;
-          * a ValueModel-format checkpoint: leaves ``params/llm/...`` (img/value_head ignored);
-          * an already-``llm/``-rooted tree;
-          * a raw Gemma checkpoint: leaves ``embedder/...`` / ``layer_*/...`` / ``final_norm/...``.
-        """
-        keys = list(flat)
-        if any(k.startswith("transformer/") for k in keys):
-            prefix = "transformer/"
-        elif any(k.startswith("params/llm/") for k in keys):
-            prefix = "params/llm/"
-        elif any(k.startswith("llm/") for k in keys):
-            prefix = "llm/"
-        elif any(k.startswith(("embedder/", "final_norm/")) or k.startswith("layer_") for k in keys):
-            prefix = ""
-        else:
-            raise ValueError(f"Could not locate Gemma weights in checkpoint. Sample keys: {keys[:6]}")
-
-        out: dict[str, np.ndarray] = {}
-        for k, v in flat.items():
-            if prefix:
-                if k.startswith(prefix):
-                    out["llm/" + k[len(prefix):]] = np.asarray(v)
-            elif k.startswith(("embedder/", "final_norm/")) or k.startswith("layer_"):
-                out["llm/" + k] = np.asarray(v)
-        return out
-
-    def _load_gemma_llm(self, root: pathlib.Path) -> dict[str, np.ndarray]:
-        import jax
-        import orbax.checkpoint as ocp
-
-        ckpt_path = self._resolve_gemma_ckpt(root)
-        # restore_type=np.ndarray -> host numpy, so the checkpoint's original
-        # (multi-device) sharding is irrelevant. This orbax version requires the
-        # restore item to match the full on-disk tree, so we restore everything
-        # (incl. any ema_params / step) and then pick out the Gemma 'llm' subtree.
-        with ocp.PyTreeCheckpointer() as ckptr:
-            metadata = ckptr.metadata(str(ckpt_path))
-            item = dict(metadata)
-            restored = ckptr.restore(
-                str(ckpt_path),
-                ocp.args.PyTreeRestore(
-                    item=item,
-                    restore_args=jax.tree.map(
-                        lambda _: ocp.ArrayRestoreArgs(restore_type=np.ndarray), item
-                    ),
-                ),
-            )
-        # Prefer the upstream gemma converter (FLAT transformer/* -> nested
-        # {embedder, layer_*, final_norm}, einsum '/w' unwrapped by param_remapper);
-        # fall back to a direct prefix mapping if the gemma lib path is unavailable.
-        nested = _maybe_convert_gemma_ckpt_tree(restored)
-        if nested is not None:
-            flat = flax.traverse_util.flatten_dict(nested, sep="/")
-            out = {"llm/" + k: np.asarray(v) for k, v in flat.items()}
-            if out:
-                logger.info("ValueModelWeightLoader: gemma tree converted via gemma.gm.ckpts (%d leaves)", len(out))
-                return out
-        flat = flax.traverse_util.flatten_dict(restored, sep="/")
-        return self._gemma_flat_to_llm(flat)
-
-    def load(self, params: at.Params) -> at.Params:
-        root = self._resolve_root()
-
-        flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
-        result = dict(flat_ref)
-
-        siglip = self._load_siglip_img(root)
-        gemma = self._load_gemma_llm(root)
-
-        filled: set[str] = set()
-        shape_mismatch: list[str] = []
-        unused: list[str] = []
-
-        for source_name, source in (("siglip(img)", siglip), ("gemma(llm)", gemma)):
-            n_used = 0
-            for k, v in source.items():
-                tk = k
-                # Gemma stores some einsum weights as ".../w" (e.g. mlp/gating_einsum/w),
-                # while this repo's Gemma module exposes the param directly (mlp/gating_einsum).
-                # Drop a trailing "/w" when only the stripped key exists in the model.
-                if tk not in flat_ref and tk.endswith("/w") and tk[: -len("/w")] in flat_ref:
-                    tk = tk[: -len("/w")]
-                if tk not in flat_ref:
-                    unused.append(f"{source_name}:{k}")
-                    continue
-                ref = flat_ref[tk]
-                if tuple(v.shape) != tuple(ref.shape):
-                    shape_mismatch.append(f"{tk}: source{tuple(v.shape)} != model{tuple(ref.shape)}")
-                    continue
-                result[tk] = v.astype(ref.dtype) if v.dtype != ref.dtype else v
-                filled.add(tk)
-                n_used += 1
-            logger.info("ValueModelWeightLoader: loaded %d leaves from %s", n_used, source_name)
-
-        if shape_mismatch:
-            raise ValueError(
-                "ValueModelWeightLoader: shape mismatch between source and model params:\n  "
-                + "\n  ".join(shape_mismatch)
-            )
-
-        # Every backbone leaf (img/* and llm/*) MUST be filled from the pretrained source.
-        backbone_ref = [k for k in flat_ref if k.startswith("img/") or k.startswith("llm/")]
-        missing = sorted(k for k in backbone_ref if k not in filled)
-        if missing:
-            raise ValueError(
-                f"ValueModelWeightLoader: {len(missing)} backbone leaves were NOT filled from "
-                "pretrained weights (frozen-random backbone would result):\n  "
-                + "\n  ".join(missing[:20])
-                + ("\n  ..." if len(missing) > 20 else "")
-            )
-
-        kept_random = sorted(k for k in flat_ref if k not in filled)
-        logger.info(
-            "ValueModelWeightLoader: %d backbone leaves loaded, %d value-head/fusion leaves kept random (%s)",
-            len(filled),
-            len(kept_random),
-            ", ".join(sorted({k.split("/")[0] for k in kept_random})),
         )
-        if unused:
-            logger.warning(
-                "ValueModelWeightLoader: %d source keys had no matching model param and were ignored "
-                "(expected: SigLIP MAPHead/text-tower, extra ValueModel layers in the Gemma checkpoint). "
-                "First few: %s",
-                len(unused),
-                ", ".join(unused[:8]),
+    if unexpected:
+        sample = sorted(unexpected)[:10]
+        logger.warning(
+            console.warn(
+                f"{log_prefix} unexpected loaded keys: {len(unexpected)} (sample: {sample})"
             )
+        )
+    if shape_mismatch:
+        sample = shape_mismatch[:5]
+        logger.warning(
+            console.warn(
+                f"{log_prefix} shape mismatch: {len(shape_mismatch)} (sample: {sample})"
+            )
+        )
+    if dtype_cast:
+        logger.info(console.info(f"{log_prefix} dtype-cast params: {dtype_cast}"))
 
-        return flax.traverse_util.unflatten_dict(result, sep="/")
+    return flax.traverse_util.unflatten_dict(result, sep="/")
