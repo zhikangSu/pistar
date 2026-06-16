@@ -300,8 +300,18 @@ class GemmaValueTokenizer:
         state["_tokenizer"] = None
         return state
 
-    def tokenize(self, prompt: str, state: Any | None = None) -> tuple[np.ndarray, np.ndarray]:
-        del state
+    def tokenize(
+        self,
+        prompt: str,
+        state: Any | None = None,
+        adv_ind=None,
+        *,
+        adv_ind_dropout: float = 0.0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        # The value tokenizer only needs the prompt; state / adv_ind (advantage
+        # conditioning) are accepted for interface-compat with
+        # transforms.TokenizePrompt but ignored here.
+        del state, adv_ind, adv_ind_dropout
 
         tokenizer = self._get_tokenizer()
         text = f"{str(prompt).rstrip()}\nValue:"

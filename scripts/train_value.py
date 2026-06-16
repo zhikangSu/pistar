@@ -133,8 +133,18 @@ class GemmaValueTokenizer:
         state["_tokenizer"] = None
         return state
 
-    def tokenize(self, prompt: str, state: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
-        del state
+    def tokenize(
+        self,
+        prompt: str,
+        state: jnp.ndarray | None = None,
+        adv_ind=None,
+        *,
+        adv_ind_dropout: float = 0.0,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        # The value tokenizer only needs the prompt. `state` and `adv_ind`
+        # (advantage conditioning, used by the RECAP policy) are accepted for
+        # interface-compat with transforms.TokenizePrompt but ignored here.
+        del state, adv_ind, adv_ind_dropout
 
         tokenizer = self._get_tokenizer()
         text = f"{str(prompt).rstrip()}\nValue:"
@@ -711,9 +721,11 @@ def main():
             )
         logging.info("\033[1;32mFSDP分片完成\033[0m")
     else:
-        # 单卡：复制到所有设备
+        # 单卡：复制到所有设备。注意 TrainState 是普通 dataclass（非 pytree），
+        # jax.tree.map 会把它当作单个叶子，故对非数组叶子需原样返回（与上面 FSDP 分支一致），
+        # 实际分片由 jit_train_step 的 in_shardings 处理。
         train_state = jax.tree.map(
-            lambda x: jax.device_put(x, replicated_sharding), 
+            lambda x: jax.device_put(x, replicated_sharding) if hasattr(x, 'shape') else x,
             train_state,
             is_leaf=lambda x: hasattr(x, 'shape')
         )

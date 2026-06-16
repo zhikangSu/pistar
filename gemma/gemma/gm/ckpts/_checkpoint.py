@@ -27,6 +27,14 @@ from etils.etree import jax as etree  # pylint: disable=g-importing-member
 import flax
 import jax
 from kauldron import kd
+
+# `etils.etree.jax.copy` was removed in newer etils (>=1.x); provide a structural
+# copy fallback so the checkpoint tree converters keep working.
+try:
+    _etree_copy = etree.copy  # type: ignore[attr-defined]
+except AttributeError:
+    def _etree_copy(_tree):
+        return jax.tree_util.tree_map(lambda _v: _v, _tree)
 import numpy as np
 from orbax import checkpoint as ocp
 
@@ -154,7 +162,7 @@ class _CheckpointTree:
       # Unflatten the params structure
       target_params = _nested_to_flat(ckpt_params)
     elif self.type == _CheckpointType.KAULDRON:
-      target_params = etree.copy(metadata.tree)
+      target_params = _etree_copy(metadata.tree)
       target_params["params"] = ckpt_params
     elif self.type == _CheckpointType.STACKED:
       target_params = _nested_to_stacked(
@@ -311,14 +319,14 @@ def load_params(
 
 def _stacked_to_nested(params: Params) -> Params:
   """Reformat the params from STACKED to NESTED."""
-  params = etree.copy(params)
+  params = _etree_copy(params)
   params = _compat.unstack_params(params)
   return _flat_to_nested(params)
 
 
 def _flat_to_nested(params: Params) -> Params:
   """Reformat the params from FLAT to NESTED."""
-  params = etree.copy(params)
+  params = _etree_copy(params)
   # Split the params for the MM and the transformer.
   transformer_params = {
       k: v for k, v in params.items() if k.startswith("transformer/")
@@ -345,7 +353,7 @@ def _nested_to_stacked(params: Params, attn_pattern_len: int) -> Params:
 
 def _nested_to_flat(params: Params) -> Params:
   """Reformat the params from NESTED to FLAT."""
-  params = etree.copy(params)  # Copy to allow mutating the tree.
+  params = _etree_copy(params)  # Copy to allow mutating the tree.
 
   mm_params = params.pop("vision_encoder", {})
   if mm_params:
@@ -371,7 +379,7 @@ def _flat_to_nested_single(params: Params, *, name: str) -> Params:
 def _remove_mm_params(params):
   """Remove the MM params."""
   # Copy to allow mutating the tree.
-  params = etree.copy(params)
+  params = _etree_copy(params)
 
   # TODO(epot): Once orbax supports partial restore, we would not need to
   # load those extra params in the first place.
@@ -384,7 +392,7 @@ def _remove_mm_params(params):
 
 def _add_skip_mm_params(params: Params, metadata: _CheckpointTree) -> Params:
   """Add skip MM params to restore."""
-  params = etree.copy(params)
+  params = _etree_copy(params)
   params_with_mm = metadata.nested_tree
 
   # Params should not be restored in the first place.

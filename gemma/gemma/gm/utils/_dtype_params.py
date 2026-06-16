@@ -14,13 +14,14 @@
 
 """Training property."""
 
+from __future__ import annotations
+
 from collections.abc import Iterator
 import contextlib
 import dataclasses
 import functools
 
 from etils import edc
-from etils.edc import ContextStack
 from etils.epy import _internal
 from flax import linen as nn
 import jax

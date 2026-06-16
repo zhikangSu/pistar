@@ -131,7 +131,15 @@ def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
-    repo_id = data_config.repo_id
+    # Support loading a dataset directly from a local directory (used by the value
+    # training path, which passes an absolute lerobot dataset dir via local_data_dir).
+    if data_config.local_data_dir is not None:
+        local_dir = data_config.local_data_dir
+        if not os.path.exists(local_dir):
+            raise ValueError(f"Local data directory does not exist: {local_dir}")
+        repo_id = local_dir
+    else:
+        repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
@@ -140,7 +148,7 @@ def create_torch_dataset(
     # root: /path/to/your/dataset/lerobot/libero
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id) #, root="/public/home/chenyuyao1/dataset/lerobot/libero")
     dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
+        repo_id,
         # root="/public/home/chenyuyao1/dataset/lerobot/libero",
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
@@ -540,3 +548,89 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+
+class ValueDataLoaderImpl(DataLoader):
+    """DataLoader for value-function training: yields (observation, value) batches.
+
+    Ported from upstream ybpy/pistar (commit 241d3da8 "update dataloader and
+    weightloader").
+    """
+
+    def __init__(
+        self,
+        data_config: _config.DataConfig,
+        data_loader: TorchDataLoader,
+        dataset: Dataset,
+    ):
+        self._data_config = data_config
+        self._data_loader = data_loader
+        self.dataset = dataset
+
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
+
+    def __len__(self) -> int:
+        try:
+            return len(self._data_loader)
+        except TypeError:
+            return len(self.dataset)
+
+    def __iter__(self):
+        for batch in self._data_loader:
+            yield _model.Observation.from_dict(batch), batch["value"]
+
+
+def create_value_data_loader(
+    data_config: _config.DataConfig,
+    model_config: _model.BaseModelConfig,
+    *,
+    batch_size: int,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    num_workers: int = 0,
+    seed: int = 0,
+    skip_norm_stats: bool = True,
+    framework: Literal["jax", "pytorch"] = "jax",
+) -> DataLoader[tuple[_model.Observation, jnp.ndarray]]:
+    """Create a data loader for value-function training.
+
+    Ported from upstream ybpy/pistar (commit 241d3da8). The dataset is built from
+    ``data_config`` (which may point at a local dir via ``local_data_dir``) and the
+    value-specific transforms (RemapValueLabelKey / ValueInputs / ...) supplied in
+    ``data_config``.
+    """
+    dataset = create_torch_dataset(data_config, model_config.action_horizon, model_config)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    sampler = None
+    if framework == "pytorch":
+        if torch.distributed.is_initialized():
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=torch.distributed.get_world_size(),
+                rank=torch.distributed.get_rank(),
+                shuffle=shuffle,
+                drop_last=True,
+            )
+            local_batch_size = batch_size // torch.distributed.get_world_size()
+        else:
+            local_batch_size = batch_size
+    else:
+        local_batch_size = batch_size // jax.process_count()
+
+    logging.info(f"local_batch_size: {local_batch_size}")
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=None if framework == "pytorch" else sharding,
+        shuffle=(sampler is None and shuffle),
+        sampler=sampler,
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=seed,
+        framework=framework,
+    )
+
+    return ValueDataLoaderImpl(data_config, data_loader, dataset)

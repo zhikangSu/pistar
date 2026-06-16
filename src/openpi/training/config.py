@@ -67,6 +67,11 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional absolute path to a local LeRobot dataset directory. If set, the data loader
+    # loads the dataset directly from this path instead of resolving `repo_id` from the HF
+    # cache. Used by the value-function training path (scripts/train_value.py). Ported from
+    # upstream ybpy/pistar (commit 241d3da8).
+    local_data_dir: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -1433,6 +1438,366 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=10_000,
         keep_period=1_000,
+    ),
+    # ------------------------------------------------------------------
+    # Pi05_star SO101 (6-DoF, single 24GB GPU) — LoRA fine-tuning.
+    # Data produced by scripts/convert_so101_v3_to_pistar.py (SO101 v3.0 -> PiStar schema).
+    # LoRA (gemma_2b_lora + gemma_300m_lora) + explicit freeze_filter + ema_decay=None so the
+    # ~3.4B pi0.5 fits a single 24GB 4090 (only ~0.47B params trainable). See docs §11.
+    # NOTE: action/state are 6-DoF (5 joints + gripper). For real-robot deploy, slice model
+    # actions to [:6] (the reused LiberoOutputs slices [:7]); harmless for training/norm_stats.
+    # ------------------------------------------------------------------
+    TrainConfig(
+        name="pi05_star_so101",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_v2_pistar",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,  # LoRA: turn EMA off
+        # Local pi05_base weights (already downloaded on the training host). Swap back to
+        # "gs://openpi-assets/checkpoints/pi05_base/params" if running where the GCS path is reachable.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        # Must be built from the SAME lora variants as `model` above, else nothing is frozen.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        keep_period=5_000,
+    ),
+    # Inference/serving counterpart: identical model, adv_ind dropout disabled.
+    TrainConfig(
+        name="pi05_star_so101_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_v2_pistar",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            adv_ind_dropout=False,  # disable adv_ind dropout during inference
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        keep_period=5_000,
+    ),
+    # ---- RECAP round2 FROM-BASE retrain (paper-faithful, §V-D p.7: each round re-finetune from the
+    # PRETRAINED ckpt rather than warm-starting from the previous round, to avoid multi-round drift).
+    # Copy of pi05_star_so101; differs ONLY in data.repo_id (merged demo+round1+round2, advantage-
+    # labeled). weight_loader stays pi05_base, 30k steps, default LR -> learns advantage conditioning
+    # fresh on the cumulative labeled data. ----
+    TrainConfig(
+        name="pi05_star_so101_recap_r2",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_v2_pistar_recap_r2",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        keep_period=5_000,
+    ),
+    # Inference/serving counterpart for recap_r2 (adv_ind dropout disabled; serves recap_r2 norm_stats).
+    TrainConfig(
+        name="pi05_star_so101_recap_r2_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_v2_pistar_recap_r2",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            adv_ind_dropout=False,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        keep_period=5_000,
+    ),
+    # ---- OOD-demo experiment (A/B): both FROM-BASE. A = demos only (orig 54 + new 60 OOD-position
+    # demos), tests whether broader demo coverage alone fixes OOD. B = those demos + round1+round2
+    # advantage-labeled rollouts. Copies of pi05_star_so101; differ only in data.repo_id. ----
+    TrainConfig(
+        name="pi05_star_so101_demoA",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_demoA",
+            base_config=DataConfig(prompt_from_task=True), extra_delta_transform=False,
+        ),
+        batch_size=16, num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=1e-4, decay_steps=30_000, decay_lr=1e-5),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0), ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000, keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_star_so101_demoA_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_demoA",
+            base_config=DataConfig(prompt_from_task=True), extra_delta_transform=False, adv_ind_dropout=False,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=1e-4, decay_steps=30_000, decay_lr=1e-5),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0), ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000, keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_star_so101_demoB",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_demoB",
+            base_config=DataConfig(prompt_from_task=True), extra_delta_transform=False,
+        ),
+        batch_size=16, num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=1e-4, decay_steps=30_000, decay_lr=1e-5),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0), ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000, keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_star_so101_demoB_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_demoB",
+            base_config=DataConfig(prompt_from_task=True), extra_delta_transform=False, adv_ind_dropout=False,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=1e-4, decay_steps=30_000, decay_lr=1e-5),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0), ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000, keep_period=5_000,
+    ),
+    # ---- RECAP round1 warm-start. Copy of pi05_star_so101; differs only in: data.repo_id (merged
+    # demo+round1 set), weight_loader (warm-start from cold-start so101_lora_v1/29999 LoRA), gentle
+    # LR (refine not disrupt), and 8000-step continue. resume=False -> fresh optimizer/step. ----
+    TrainConfig(
+        name="pi05_star_so101_recap",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_v2_pistar_recap_r1",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=8_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,  # LoRA: turn EMA off
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/pistar/checkpoints/pi05_star_so101/so101_lora_v1/29999/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=8_000,
+        keep_period=2_000,
+    ),
+    # Inference/serving counterpart for the RECAP checkpoint: adv_ind dropout disabled, recap repo_id
+    # so transforms match. (Norm stats are loaded from the checkpoint's own bundled assets at serve.)
+    TrainConfig(
+        name="pi05_star_so101_recap_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_v2_pistar_recap_r1",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            adv_ind_dropout=False,  # disable adv_ind dropout during inference
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/pistar/checkpoints/pi05_star_so101/so101_lora_v1/29999/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        keep_period=5_000,
     ),
     #
     # Fine-tuning Aloha configs.
