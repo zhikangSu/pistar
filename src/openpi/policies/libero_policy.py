@@ -51,6 +51,15 @@ class LiberoInputs(transforms.DataTransformFn):
         # right wrist image below.
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
+        # Optional 3rd camera (e.g. SO101 `fixed_1`). When the dataset/inference inputs
+        # carry it, fill the right-wrist slot with the real image and unmask it; otherwise
+        # keep the original zero-pad + masked behavior (2-camera datasets unchanged).
+        if "observation/right_wrist_image" in data:
+            right_wrist_image = _parse_image(data["observation/right_wrist_image"])
+            right_wrist_mask = np.True_
+        else:
+            right_wrist_image = np.zeros_like(base_image)
+            right_wrist_mask = np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_
 
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
@@ -58,14 +67,12 @@ class LiberoInputs(transforms.DataTransformFn):
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
-                # Pad any non-existent images with zero-arrays of the appropriate shape.
-                "right_wrist_0_rgb": np.zeros_like(base_image),
+                "right_wrist_0_rgb": right_wrist_image,
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
-                # We only mask padding images for pi0 model, not pi0-FAST. Do not change this for your own dataset.
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+                "right_wrist_0_rgb": right_wrist_mask,
             },
         }
 

@@ -239,6 +239,7 @@ def main(
     tolerance_s: float = 0.05,
     fixed_key: str = "observation.images.fixed",
     wrist_key: str = "observation.images.wrist",
+    right_wrist_key: str | None = None,
     state_key: str = "observation.state",
     action_key: str = "action",
     decode_batch_size: int = 64,
@@ -321,24 +322,32 @@ def main(
     if len(episode_table) == 0:
         raise ValueError("No episodes left after subset selection.")
 
+    features = {
+        "image": {"dtype": "image", "shape": (image_size, image_size, 3),
+                  "names": ["height", "width", "channel"]},
+        "wrist_image": {"dtype": "image", "shape": (image_size, image_size, 3),
+                        "names": ["height", "width", "channel"]},
+        "state": {"dtype": "float32", "shape": (state_dim,), "names": ["state"]},
+        "actions": {"dtype": "float32", "shape": (action_dim,), "names": ["actions"]},
+        "intervention": {"dtype": "int64", "shape": (1,), "names": ["intervention_flag"]},
+        "value_label": {"dtype": "float32", "shape": (1,), "names": ["value_label"]},
+        "reward": {"dtype": "float32", "shape": (1,), "names": ["reward"]},
+        "reward_label": {"dtype": "float32", "shape": (1,), "names": ["reward_label"]},
+        "adv_ind": {"dtype": "string", "shape": (1,), "names": ["adv_ind"]},
+    }
+    # Optional 3rd camera (e.g. observation.images.fixed_1) -> right_wrist_image.
+    if right_wrist_key:
+        features["right_wrist_image"] = {
+            "dtype": "image", "shape": (image_size, image_size, 3),
+            "names": ["height", "width", "channel"],
+        }
+
     dataset = LeRobotDataset.create(
         repo_id=repo_name,
         root=out_path,
         robot_type="so101",
         fps=src_fps,
-        features={
-            "image": {"dtype": "image", "shape": (image_size, image_size, 3),
-                      "names": ["height", "width", "channel"]},
-            "wrist_image": {"dtype": "image", "shape": (image_size, image_size, 3),
-                            "names": ["height", "width", "channel"]},
-            "state": {"dtype": "float32", "shape": (state_dim,), "names": ["state"]},
-            "actions": {"dtype": "float32", "shape": (action_dim,), "names": ["actions"]},
-            "intervention": {"dtype": "int64", "shape": (1,), "names": ["intervention_flag"]},
-            "value_label": {"dtype": "float32", "shape": (1,), "names": ["value_label"]},
-            "reward": {"dtype": "float32", "shape": (1,), "names": ["reward"]},
-            "reward_label": {"dtype": "float32", "shape": (1,), "names": ["reward_label"]},
-            "adv_ind": {"dtype": "string", "shape": (1,), "names": ["adv_ind"]},
-        },
+        features=features,
         image_writer_threads=10,
         image_writer_processes=5,
     )
@@ -396,6 +405,13 @@ def main(
         )
         fixed_base = float(row[f"videos/{fixed_key}/from_timestamp"])
         wrist_base = float(row[f"videos/{wrist_key}/from_timestamp"])
+        if right_wrist_key:
+            right_wrist_video = source_video_path(
+                src, right_wrist_key,
+                int(row[f"videos/{right_wrist_key}/chunk_index"]),
+                int(row[f"videos/{right_wrist_key}/file_index"]),
+            )
+            right_wrist_base = float(row[f"videos/{right_wrist_key}/from_timestamp"])
         ep_ts = ep_df["timestamp"].to_numpy(dtype=np.float64)
 
         for start in range(0, T, decode_batch_size):
@@ -407,10 +423,14 @@ def main(
             wrist_frames = decode_frames_pyav(
                 wrist_video, wrist_base + ep_ts[sl], tolerance_s=tolerance_s, image_size=image_size
             )
+            right_wrist_frames = None
+            if right_wrist_key:
+                right_wrist_frames = decode_frames_pyav(
+                    right_wrist_video, right_wrist_base + ep_ts[sl], tolerance_s=tolerance_s, image_size=image_size
+                )
             for k in range(end - start):
                 i = start + k
-                dataset.add_frame(
-                    {
+                frame = {
                         "image": fixed_frames[k],
                         "wrist_image": wrist_frames[k],
                         "state": states[i],
@@ -422,7 +442,9 @@ def main(
                         "adv_ind": adv_ind_value,
                         "task": task,
                     }
-                )
+                if right_wrist_frames is not None:
+                    frame["right_wrist_image"] = right_wrist_frames[k]
+                dataset.add_frame(frame)
                 total_frames += 1
 
         dataset.save_episode()
