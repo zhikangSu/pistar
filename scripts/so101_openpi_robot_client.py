@@ -57,15 +57,28 @@ FIXED_CAM = {
 }
 WRIST_CAM = {
     "index_or_path": "/dev/v4l/by-id/usb-icSpring_icspring_camera-video-index0",
-    "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV",
+    # MJPG (not YUYV): with 3 cameras sharing USB bandwidth, YUYV starves fixed_1. Matches
+    # record_pretty.py's 3-cam config so deploy images == training images.
+    "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG",
+}
+# 3rd camera (fixed_1) -> observation/right_wrist_image. Only sent when --no-third-cam is NOT set.
+# Plain opencv 640x480 MJPG, identical to record_pretty.py CAMERAS["fixed_1"].
+FIXED1_CAM = {
+    "index_or_path": "/dev/v4l/by-id/usb-04014008_P040200_SN0002_720P_USB_Camera_04014008_P040200_SN0002-video-index0",
+    "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG",
 }
 DEFAULT_ROBOT_PORT = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C4C128258-if00"
 DEFAULT_ROBOT_ID = "so101_follower"
 DEFAULT_PROMPT = "Pick up the cube and place it into the blue plate"
 
 
-def build_robot(robot_port: str, robot_id: str, max_relative_target):
-    """Construct the lerobot SO101Follower with cameras identical to record_pretty.py."""
+def build_robot(robot_port: str, robot_id: str, max_relative_target, third_cam: bool = True):
+    """Construct the lerobot SO101Follower with cameras identical to record_pretty.py.
+
+    third_cam=True (default) adds the fixed_1 camera for 3-camera models (e.g.
+    pi05_star_so101_3cam). Pass third_cam=False for 2-camera models (demoA/recap) —
+    sending a real 3rd image to a 2-cam policy (trained with that slot zero-masked) garbles it.
+    """
     from lerobot.cameras import Cv2Rotation
     from lerobot.cameras.opencv import OpenCVCameraConfig
     from lerobot.robots.so_follower import SO101Follower
@@ -86,22 +99,35 @@ def build_robot(robot_port: str, robot_id: str, max_relative_target):
             fourcc=WRIST_CAM["fourcc"],
         ),
     }
+    if third_cam:
+        cameras["fixed_1"] = OpenCVCameraConfig(
+            index_or_path=FIXED1_CAM["index_or_path"],
+            width=FIXED1_CAM["width"], height=FIXED1_CAM["height"], fps=FIXED1_CAM["fps"],
+            fourcc=FIXED1_CAM["fourcc"],
+        )
     config = SO101FollowerConfig(
         port=robot_port, id=robot_id, cameras=cameras, max_relative_target=max_relative_target
     )
     return SO101Follower(config)
 
 
-def build_openpi_obs(robot_obs: dict, prompt: str, adv_ind: str) -> dict:
-    """Map lerobot observation -> openpi observation (same format as eval_so101_val_sanity.py)."""
+def build_openpi_obs(robot_obs: dict, prompt: str, adv_ind: str, third_cam: bool = True) -> dict:
+    """Map lerobot observation -> openpi observation (same format as eval_so101_val_sanity.py).
+
+    third_cam=True adds observation/right_wrist_image (fixed_1) for 3-camera models. The
+    server's LiberoInputs uses it (mask=True) when present, else zero-pads + masks it off.
+    """
     state = np.array([float(robot_obs[f"{j}.pos"]) for j in JOINT_ORDER], dtype=np.float32)
-    return {
+    obs = {
         "observation/image": np.asarray(robot_obs["fixed"]),        # 505x480x3 uint8 (rotated+cropped)
         "observation/wrist_image": np.asarray(robot_obs["wrist"]),  # 480x640x3 uint8
         "observation/state": state,                                 # (6,) degrees, dataset joint order
         "prompt": prompt,
         "adv_ind": adv_ind,
     }
+    if third_cam:
+        obs["observation/right_wrist_image"] = np.asarray(robot_obs["fixed_1"])  # 480x640x3 uint8
+    return obs
 
 
 def actions_to_joint_command(action_row: np.ndarray) -> dict:
@@ -123,8 +149,10 @@ def self_check() -> int:
         assert fx.width == 480 and fx.height == 505 and fx.crop_top == 135, "fixed crop mismatch"
         assert str(fx.rotation).endswith("ROTATE_270"), f"fixed rotation mismatch: {fx.rotation}"
         assert cams["wrist"].width == 640 and cams["wrist"].height == 480, "wrist size mismatch"
+        assert "fixed_1" in cams and cams["fixed_1"].width == 640 and cams["fixed_1"].height == 480, \
+            "fixed_1 (3rd cam) missing/size mismatch"
         print(f"[ok] robot+cameras built | fixed=480x505 ROTATE_270 crop_top=135 | wrist=640x480 "
-              f"| obs_features keys sample={list(robot.observation_features)[:3]}...")
+              f"| fixed_1=640x480 (3rd cam) | obs_features keys sample={list(robot.observation_features)[:3]}...")
     except Exception as e:  # noqa: BLE001
         print(f"[FAIL] robot/camera construction: {e}")
         ok = False
@@ -133,14 +161,21 @@ def self_check() -> int:
     fake_robot_obs = {f"{j}.pos": 1.0 * i for i, j in enumerate(JOINT_ORDER)}
     fake_robot_obs["fixed"] = np.zeros((505, 480, 3), dtype=np.uint8)
     fake_robot_obs["wrist"] = np.zeros((480, 640, 3), dtype=np.uint8)
-    obs = build_openpi_obs(fake_robot_obs, DEFAULT_PROMPT, "positive")
-    assert set(obs) == {"observation/image", "observation/wrist_image", "observation/state", "prompt", "adv_ind"}
+    fake_robot_obs["fixed_1"] = np.zeros((480, 640, 3), dtype=np.uint8)
+    # 3-camera (default): obs carries the 3rd image
+    obs = build_openpi_obs(fake_robot_obs, DEFAULT_PROMPT, "positive", third_cam=True)
+    assert set(obs) == {"observation/image", "observation/wrist_image", "observation/right_wrist_image",
+                        "observation/state", "prompt", "adv_ind"}, f"3cam obs keys wrong: {sorted(obs)}"
     assert obs["observation/image"].shape == (505, 480, 3)
     assert obs["observation/wrist_image"].shape == (480, 640, 3)
+    assert obs["observation/right_wrist_image"].shape == (480, 640, 3)
     assert obs["observation/state"].shape == (6,)
     assert list(obs["observation/state"]) == [0, 1, 2, 3, 4, 5], "state joint order wrong"
-    print(f"[ok] openpi obs keys={sorted(obs)} | image{obs['observation/image'].shape} "
-          f"wrist{obs['observation/wrist_image'].shape} state{obs['observation/state'].shape}")
+    # 2-camera (--no-third-cam): obs must NOT carry the 3rd image (back-compat for demoA/recap)
+    obs2 = build_openpi_obs(fake_robot_obs, DEFAULT_PROMPT, "positive", third_cam=False)
+    assert "observation/right_wrist_image" not in obs2, "2cam mode must omit right_wrist_image"
+    print(f"[ok] openpi obs (3cam) keys={sorted(obs)} | right_wrist{obs['observation/right_wrist_image'].shape} "
+          f"| 2cam mode omits 3rd cam OK")
 
     # 3) action chunk [:, :6] slice + joint command mapping
     fake_chunk = np.arange(10 * 7, dtype=np.float32).reshape(10, 7)  # server returns (H, 7)
@@ -177,6 +212,9 @@ def main() -> int:
     ap.add_argument("--robot-port", default=DEFAULT_ROBOT_PORT)
     ap.add_argument("--robot-id", default=DEFAULT_ROBOT_ID)
     ap.add_argument("--no-confirm", action="store_true", help="skip the startup confirmation prompt")
+    ap.add_argument("--no-third-cam", action="store_true",
+                    help="omit the 3rd camera (fixed_1 -> right_wrist_image); use for 2-camera "
+                         "models like pi05_star_so101_demoA/recap. Default sends 3 cameras (3cam models).")
     args = ap.parse_args()
 
     if args.self_check:
@@ -184,12 +222,14 @@ def main() -> int:
 
     from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
-    robot = build_robot(args.robot_port, args.robot_id, args.max_relative_target)
+    third_cam = not args.no_third_cam
+    robot = build_robot(args.robot_port, args.robot_id, args.max_relative_target, third_cam=third_cam)
 
     print("=" * 64)
     print("⚠️  REAL ROBOT — the SO101 arm WILL move under policy control.")
     print(f"    server   : ws://{args.server_host}:{args.port}")
     print(f"    prompt   : {args.prompt!r}   adv_ind={args.adv_ind}")
+    print(f"    cameras  : {'3 (fixed+wrist+fixed_1)' if third_cam else '2 (fixed+wrist) — --no-third-cam'}")
     print(f"    fps={args.fps}  exec_horizon={args.exec_horizon}  max_steps={args.max_steps}")
     print(f"    max_relative_target={args.max_relative_target}"
           f"{'  (UNSET — no per-step clamp; consider --max-relative-target 15)' if args.max_relative_target is None else ''}")
@@ -212,7 +252,7 @@ def main() -> int:
     try:
         while step < args.max_steps:
             robot_obs = robot.get_observation()
-            obs = build_openpi_obs(robot_obs, args.prompt, args.adv_ind)
+            obs = build_openpi_obs(robot_obs, args.prompt, args.adv_ind, third_cam=third_cam)
             t0 = time.perf_counter()
             result = client.infer(obs)
             chunk = np.asarray(result["actions"])  # (H, 7)
