@@ -40,6 +40,14 @@ import openpi.training.sharding as sharding
 
 PALIGEMMA_VOCAB_SIZE = 257_152
 
+# When True, Attention sows post-softmax attention probabilities into the
+# "intermediates" collection and the transformer scan maps that collection over
+# the layer axis, so a caller can recover per-layer attention weights via
+# `apply(..., mutable=["intermediates"])`. Default False keeps the normal
+# train/inference forward 100% unchanged (no extra collection, no overhead).
+# Set to True *before* building the model (e.g. in a visualization script).
+CAPTURE_ATTN = False
+
 
 @dataclasses.dataclass
 class Config:
@@ -227,6 +235,11 @@ class Attention(nn.Module):
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
 
+        if CAPTURE_ATTN:
+            # probs shape: [B, K(kv_heads), G(query_heads_per_kv), T(query), S(key)].
+            # Sowed here so a viz caller can pull post-softmax attention per layer.
+            self.sow("intermediates", "attn_probs", probs)
+
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
@@ -362,9 +375,14 @@ class Module(nn.Module):
             static_argnums=(5,),  # 0=self, 6=deterministic
             policy=jax.checkpoint_policies.nothing_saveable,
         )
+        _variable_axes = {"params": 0}
+        if CAPTURE_ATTN:
+            # Map the sowed attention "intermediates" over the layer (scan) axis so
+            # the returned weights are stacked as [depth, B, K, G, T, S].
+            _variable_axes["intermediates"] = 0
         self.layers = nn.scan(
             block_cls,
-            variable_axes={"params": 0},
+            variable_axes=_variable_axes,
             split_rngs={"params": True, "dropout": True},
             in_axes=(
                 0,
