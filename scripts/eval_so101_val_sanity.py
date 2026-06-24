@@ -131,6 +131,10 @@ def main() -> None:
                 "prompt": task,
                 "adv_ind": args.adv_ind,
             }
+            # 3-camera datasets carry a 3rd view; feed it so 3cam policies don't get a
+            # zero-padded right_wrist (which garbles inference). 2cam data: key absent, skipped.
+            if "right_wrist_image" in fr:
+                obs["observation/right_wrist_image"] = _to_np(fr["right_wrist_image"])
             pred = _to_np(policy.infer(obs)["actions"])[:, :D]  # (H, D)
             gt = acts[t : t + horizon, :D]                      # (H, D)
             all_pred.append(pred)
