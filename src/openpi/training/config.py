@@ -1821,6 +1821,54 @@ _CONFIGS = [
         ).get_freeze_filter(),
         num_train_steps=30_000, keep_period=5_000,
     ),
+    # ---- EE-orient(action10=[位置delta3 + 目标朝向6D + gripper], state15=[6关节+ee_xyz+ee当前6D朝向]) ----
+    # 修"只位置丢朝向→5DoF臂IK乱挑手腕姿态→抓不住": 加绝对6D朝向, 部署IK orientation_weight=1。
+    # 位置仍delta(几何reward可微), action_dim=32 padding 自动适配 10。
+    TrainConfig(
+        name="pi05_star_so101_v4_ee_orient_3cam",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_v4_ee_orient_pistar",
+            base_config=DataConfig(prompt_from_task=True), extra_delta_transform=False, three_cam=True,
+        ),
+        batch_size=16, num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=1e-4, decay_steps=30_000, decay_lr=1e-5),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0), ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000, keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_star_so101_v4_ee_orient_3cam_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_v4_ee_orient_pistar",
+            base_config=DataConfig(prompt_from_task=True), extra_delta_transform=False, three_cam=True,
+            adv_ind_dropout=False, action_dim=10,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=1e-4, decay_steps=30_000, decay_lr=1e-5),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0), ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000, keep_period=5_000,
+    ),
     TrainConfig(
         name="pi05_star_so101_v4_2cam_infer",
         project_name="pistar",
