@@ -5,6 +5,7 @@ import socket
 
 import tyro
 
+from openpi.models import ee_steer as _ee_steer
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
@@ -54,6 +55,17 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # ---- 几何 reward 去噪引导（EE-delta 部署专用）----
+    # guide_scale=0.0（默认）→ 零回归：sample_actions 内 Python if 短路，不注入引导。
+    # guide_scale>0 → 启用 ee_steer.grasp_place_reward 引导。每-episode 的 cube_xyz/plate_xyz
+    # 优先由【推理请求 obs】带进来（client 每帧附 "cube_xyz"/"plate_xyz"）；下方 CLI 仅作启动固定退路。
+    guide_scale: float = 0.0
+    # 仅在去噪后段 time<=start_ratio 注入引导。
+    start_ratio: float = 0.6
+    # 启动固定 cube/plate 坐标（base 系，米）。client 若在 obs 带 cube_xyz/plate_xyz 会逐帧覆盖之。
+    cube_xyz: tuple[float, float, float] | None = None
+    plate_xyz: tuple[float, float, float] | None = None
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -85,12 +97,36 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
+def _build_steer_sample_kwargs(args: Args) -> dict | None:
+    """构造几何引导的 sample_kwargs。guide_scale<=0 返回 None（零回归，不传任何 guide kwarg）。"""
+    if not args.guide_scale:
+        return None
+    import jax.numpy as jnp  # 局部 import，避免无引导时多余依赖
+
+    sk: dict = {
+        "reward_fn": _ee_steer.grasp_place_reward,
+        "guide_scale": float(args.guide_scale),
+        "start_ratio": float(args.start_ratio),
+    }
+    # 启动固定坐标（退路）；client 在 obs 带 cube_xyz/plate_xyz 时会在 Policy.infer 逐帧覆盖。
+    if args.cube_xyz is not None:
+        sk["cube_xyz"] = jnp.asarray(args.cube_xyz)[None, ...]
+    if args.plate_xyz is not None:
+        sk["plate_xyz"] = jnp.asarray(args.plate_xyz)[None, ...]
+    logging.info("Geometric steering ENABLED: guide_scale=%s start_ratio=%s", args.guide_scale, args.start_ratio)
+    return sk
+
+
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    sample_kwargs = _build_steer_sample_kwargs(args)
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                sample_kwargs=sample_kwargs,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

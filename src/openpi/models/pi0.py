@@ -234,6 +234,12 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        # ---- 几何 reward 去噪引导（EE-delta 部署专用，零回归：缺省值下 Python if 短路）----
+        reward_fn=None,          # callable(cube_xyz, plate_xyz, traj, grip)->scalar，None=不引导
+        cube_xyz=None,           # (b,3) jnp，cube 在 base 系坐标（米），每 episode 变
+        plate_xyz=None,          # (b,3) jnp，plate 在 base 系坐标（米）
+        guide_scale: float = 0.0,  # 引导强度，0.0=不引导（默认，零回归）
+        start_ratio: float = 0.6,  # 仅在 time<=start_ratio 的去噪后段注入引导
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -280,6 +286,22 @@ class Pi0(_model.BaseModel):
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            # ---- 几何 reward 去噪引导（EE-delta 部署专用，零回归）----
+            # reward_fn / guide_scale 是闭包捕获的【静态 Python 对象/常量】(非 tracer)，可用 Python if。
+            # 缺省 reward_fn=None + guide_scale=0.0 → if 短路不进，代码路径与原 :282-284 逐字节相同。
+            if reward_fn is not None and guide_scale:
+                def reward_of_x(x):
+                    a = x[:, :, :4]                               # x_t pad 到 32 维，只取前 4=[dx,dy,dz,grip]
+                    start_ee = observation.state[:, 6:9]          # state9 的 ee_xyz (b,3)
+                    traj = start_ee[:, None, :] + jnp.cumsum(a[..., :3], axis=1)
+                    return reward_fn(cube_xyz, plate_xyz, traj, a[..., 3])
+
+                g = jax.grad(reward_of_x)(x_t)
+                sc = guide_scale * jax.nn.sigmoid(12.0 * (start_ratio - time))
+                sc = jnp.where(time <= start_ratio, sc, 0.0)
+                # 符号：Euler 是 x_t + dt*v_t 且 dt<0；要 x_t 朝 +∇R（梯度上升），需 v_t -= sc*g。
+                v_t = v_t - sc * g
 
             return x_t + dt * v_t, time + dt
 

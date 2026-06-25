@@ -68,6 +68,14 @@ class Policy(BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        # ---- 几何 reward 去噪引导：从 obs 里取出每-episode 的目标坐标（不进强类型 Observation struct）----
+        # client 每次 infer 时可在 obs 里附 "cube_xyz"/"plate_xyz" (3,) 数组。这里在 _input_transform
+        # （RepackTransform 会丢弃 map 外的 key）之前 pop 出来，稍后路由进 sample_kwargs。
+        # 仅当 sample_kwargs 已配 guide 引导（reward_fn/guide_scale）时才生效；否则无害忽略。
+        steer_xyz = {}
+        for _k in ("cube_xyz", "plate_xyz"):
+            if _k in inputs:
+                steer_xyz[_k] = inputs.pop(_k)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -80,6 +88,14 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        # 路由 per-episode 目标坐标进 sample_kwargs（加 batch 维对齐 (b,3)）。
+        # 仅 JAX 模型支持几何引导；PyTorch 路径不注入（其 sample_actions 不识别该 kwarg）。
+        if steer_xyz and not self._is_pytorch_model:
+            for _k, _v in steer_xyz.items():
+                _v = jnp.asarray(_v)
+                if _v.ndim == 1:  # (3,) -> (1, 3)
+                    _v = _v[None, ...]
+                sample_kwargs[_k] = _v
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 

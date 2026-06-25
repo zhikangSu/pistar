@@ -102,9 +102,13 @@ class LiberoOutputs(transforms.DataTransformFn):
     For your own dataset, you can copy this class and modify the action dimension based on the comments below.
     """
 
+    # Number of leading action dims to keep (rest is padding). 7 for Libero/joint-space SO101.
+    # Set to 4 for EE-delta datasets ([dx, dy, dz, gripper]).
+    action_dim: int = 7
+
     def __call__(self, data: dict) -> dict:
         # Only return the first N actions -- since we padded actions above to fit the model action
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}

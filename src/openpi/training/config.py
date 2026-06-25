@@ -352,6 +352,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     extra_delta_transform: bool = False
     adv_ind_dropout: bool = True # Set to True during training to apply adv_ind dropout in model transforms
     three_cam: bool = False  # Set True for 3-camera datasets: also repack right_wrist_image (e.g. SO101 fixed_1)
+    action_dim: int = 7  # Number of real action dims returned by LiberoOutputs. 7 for joint-space, 4 for EE-delta.
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -388,7 +389,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # replace the transforms below with your own.
         data_transforms = _transforms.Group(
             inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
-            outputs=[libero_policy.LiberoOutputs()],
+            outputs=[libero_policy.LiberoOutputs(action_dim=self.action_dim)],
         )
 
         # One additional data transform: pi0 models are trained on delta actions (relative to the first
@@ -1782,6 +1783,32 @@ _CONFIGS = [
         data=LeRobotLiberoDataConfig(
             repo_id="meow/so101_cube_into_plate_v4_pistar",
             base_config=DataConfig(prompt_from_task=True), extra_delta_transform=False, three_cam=True, adv_ind_dropout=False,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=1e-4, decay_steps=30_000, decay_lr=1e-5),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0), ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000, keep_period=5_000,
+    ),
+    # ---- EE-delta 部署 infer config (照 v4_3cam_infer; data action_dim=4 → 输出切前4维[dx,dy,dz,gripper]) ----
+    # 与 pi05_star_so101_v4_ee_delta_3cam(训练版) 同 model/lr/freeze, 仅 adv_ind_dropout=False(部署).
+    # ⚠️ extra_delta_transform=False 必须保持(EE-delta 已是 delta). action_dim=4 让 LiberoOutputs 只返回前4维.
+    TrainConfig(
+        name="pi05_star_so101_v4_ee_delta_3cam_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True, pistar=True, action_horizon=10, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/so101_cube_into_plate_v4_ee_delta_pistar",
+            base_config=DataConfig(prompt_from_task=True), extra_delta_transform=False, three_cam=True,
+            adv_ind_dropout=False, action_dim=4,
         ),
         batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=1e-4, decay_steps=30_000, decay_lr=1e-5),
