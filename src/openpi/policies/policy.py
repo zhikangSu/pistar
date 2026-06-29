@@ -60,8 +60,14 @@ class Policy(BasePolicy):
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
-            # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # JAX model setup.
+            # 几何引导的 reward_fn(函数)/guide_scale/start_ratio(在 Python if/标量分支里用) 必须标 static，
+            # 否则 jax.jit 会把它们当 traced 数组而报 "Error interpreting argument ... reward_fn"。
+            # 缺省(reward_fn=None,guide_scale=0.0)时也安全：static None/0.0，if 短路、零回归。
+            self._sample_actions = nnx_utils.module_jit(
+                model.sample_actions,
+                static_argnames=("reward_fn", "guide_scale", "start_ratio", "absolute_ee"),
+            )
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -76,11 +82,20 @@ class Policy(BasePolicy):
         for _k in ("cube_xyz", "plate_xyz"):
             if _k in inputs:
                 steer_xyz[_k] = inputs.pop(_k)
+        # 可选:每-请求覆盖 guide_scale(静态标量)。用于实时调参、以及 BC(0) vs VLS(>0) 对照可视化——
+        # 同一 serve 既能出引导轨迹又能出不引导轨迹,不必重启或开两个 serve。缺省=用 serve 启动时的固定值。
+        override_guide_scale = inputs.pop("guide_scale", None)
+        # 可选:固定采样噪声种子。flow-matching 每次 infer 抽新噪声→同输入也会有~cm 级抖动。传同一
+        # noise_seed 给 BC(guide=0) 与 VLS(guide>0) 两次推理,差异才纯是引导效果(不被采样噪声淹没)。
+        noise_seed = inputs.pop("noise_seed", None)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-            self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+            if noise_seed is not None:
+                sample_rng_or_pytorch_device = jax.random.key(int(np.asarray(noise_seed).reshape(-1)[0]))
+            else:
+                self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
@@ -96,6 +111,9 @@ class Policy(BasePolicy):
                 if _v.ndim == 1:  # (3,) -> (1, 3)
                     _v = _v[None, ...]
                 sample_kwargs[_k] = _v
+        # per-request guide_scale 覆盖（静态标量；不同值各编译一次并缓存）。
+        if override_guide_scale is not None and not self._is_pytorch_model:
+            sample_kwargs["guide_scale"] = float(np.asarray(override_guide_scale).reshape(-1)[0])
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 

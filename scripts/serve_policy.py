@@ -65,6 +65,11 @@ class Args:
     # 启动固定 cube/plate 坐标（base 系，米）。client 若在 obs 带 cube_xyz/plate_xyz 会逐帧覆盖之。
     cube_xyz: tuple[float, float, float] | None = None
     plate_xyz: tuple[float, float, float] | None = None
+    # 每轴 EE delta 米尺度（必须同转换/client 的 DEFAULT_EE_SCALE）；reward 反归一化算米时用（仅 delta 模型）。
+    ee_scale: tuple[float, float, float] = (0.035, 0.030, 0.060)
+    # 绝对EE模型(ee_abs config)开 VLS 必须置 True：reward 把 action[:3] 反归一化即绝对米、不 cumsum。
+    # EE-delta(ee_orient) 模型保持 False。
+    absolute_ee: bool = False
 
 
 # Default checkpoints that should be used for each environment.
@@ -107,6 +112,9 @@ def _build_steer_sample_kwargs(args: Args) -> dict | None:
         "reward_fn": _ee_steer.grasp_place_reward,
         "guide_scale": float(args.guide_scale),
         "start_ratio": float(args.start_ratio),
+        # reward 在归一化空间反归一化回米时用；q01/q99 由 create_trained_policy 从 norm_stats 注入。
+        "ee_scale": jnp.asarray(args.ee_scale),
+        "absolute_ee": bool(args.absolute_ee),   # 绝对EE模型 reward traj 直接用绝对位置
     }
     # 启动固定坐标（退路）；client 在 obs 带 cube_xyz/plate_xyz 时会在 Policy.infer 逐帧覆盖。
     if args.cube_xyz is not None:

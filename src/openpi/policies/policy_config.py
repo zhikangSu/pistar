@@ -63,6 +63,20 @@ def create_trained_policy(
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
+    # 几何引导(VLS): 去噪在分位数归一化空间，但 reward 需 base 系【米】。从刚加载的 norm_stats 注入
+    # state/action 的 q01/q99（静态、每帧不变），让 sample_actions 内 reward_of_x 反归一化回米。
+    # 仅当 sample_kwargs 已开引导(reward_fn 非空)才注入；否则零回归、不动任何东西。
+    if sample_kwargs is not None and sample_kwargs.get("reward_fn") is not None:
+        _ss, _aa = norm_stats["state"], norm_stats["actions"]
+        if _ss.q01 is None or _aa.q01 is None:
+            raise ValueError("Geometric steering requires quantile norm stats (q01/q99) in the checkpoint.")
+        sample_kwargs = dict(sample_kwargs)
+        sample_kwargs["state_q01"] = jnp.asarray(_ss.q01)[None, ...]
+        sample_kwargs["state_q99"] = jnp.asarray(_ss.q99)[None, ...]
+        sample_kwargs["act_q01"] = jnp.asarray(_aa.q01)[None, ...]
+        sample_kwargs["act_q99"] = jnp.asarray(_aa.q99)[None, ...]
+        logging.info("Geometric steering: injected de-norm q01/q99 (state/action) for meter-space reward.")
+
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
         try:

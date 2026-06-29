@@ -116,6 +116,10 @@ DEFAULT_GRIPPER_CLOSED_POS = 3.0
 DEFAULT_CUBE_XYZ_FILE = "/home/meow/SO101/calib/cube_xyz_fixed.json"
 DEFAULT_PLATE_XYZ_FILE = "/home/meow/SO101/calib/plate_xyz_fixed.json"
 
+# Optional live trajectory-viz extrinsics (base -> fixed-camera pixel). viz is OFF by default.
+# Same calibrated [K|R|t|dist] used by scripts/draw_base_frame.py & viz_ee_traj_poc.py.
+DEFAULT_EXTRINSICS_FILE = "/home/meow/SO101/calib/camera_extrinsics_fixed.npz"
+
 
 # ===========================================================================
 # Unit conversion (RANGE_M100_100 <-> degrees) — copied verbatim from the probe
@@ -325,6 +329,7 @@ def eedelta_chunk_to_joint_commands(
     gripper_threshold: float = DEFAULT_GRIPPER_THRESHOLD,
     gripper_open_pos: float = DEFAULT_GRIPPER_OPEN_POS,
     gripper_closed_pos: float = DEFAULT_GRIPPER_CLOSED_POS,
+    absolute: bool = False,
 ) -> tuple[list[dict], np.ndarray]:
     """Convert an EE-delta chunk (H, >=4) into a list of H joint-position command dicts.
 
@@ -339,11 +344,16 @@ def eedelta_chunk_to_joint_commands(
     """
     chunk = np.asarray(chunk, dtype=np.float64)
     H = chunk.shape[0]
-    # action10 = [dx,dy,dz(位置delta) + 目标朝向6D(绝对) + gripper]。
-    # 位置: 反归一化 + cumsum -> 绝对米目标(同旧版,几何reward可微).
-    delta_norm = np.clip(chunk[:, :3], -0.999, 0.999)
-    delta_m = delta_norm * np.asarray(ee_scale, dtype=np.float64)
-    abs_ee = np.asarray(start_ee, dtype=np.float64)[None, :] + np.cumsum(delta_m, axis=0)
+    # action10 col0..2 = 位置(absolute 模式=绝对EE米; 否则=归一化delta), col3..8=目标朝向6D(绝对), col9=gripper。
+    if absolute:
+        # 绝对 EE 版(pi05_star_so101_v4_ee_abs):action[:,:3] 已是绝对 base 系米,直接 IK,
+        # 无 cumsum/无 ee_scale → 去掉 EE-delta 的 cumsum 累积锯齿。start_ee/ee_scale 此模式不用。
+        abs_ee = chunk[:, :3].copy()
+    else:
+        # EE-delta 版:反归一化 + cumsum -> 绝对米目标(几何reward可微)。
+        delta_norm = np.clip(chunk[:, :3], -0.999, 0.999)
+        delta_m = delta_norm * np.asarray(ee_scale, dtype=np.float64)
+        abs_ee = np.asarray(start_ee, dtype=np.float64)[None, :] + np.cumsum(delta_m, axis=0)
 
     # warm-start IK from the current measured joints (in degrees).
     q_prev_deg = joints_range_to_degrees(np.asarray(q_start6, dtype=np.float64), calibration)
@@ -384,6 +394,189 @@ def load_guide_targets(cube_file: str, plate_file: str) -> dict:
     plate = read_json(plate_file)
     out["plate_xyz"] = [float(v) for v in plate["plate_xyz"]]
     return out
+
+
+# Calibration / detection scripts live in the SO101 workspace (not the pistar repo).
+SO101_SCRIPTS_DIR = "/home/meow/SO101/scripts"
+SO101_CALIB_DIR = "/home/meow/SO101/calib"
+
+
+def autodetect_targets(cameras: str = "fixed,fixed_1") -> dict:
+    """实时检测【当前】cube/plate 的 base 系坐标(米),供几何引导用。每次运行自动更新,不必手动先跑脚本。
+
+    直接复用 SO101/scripts 下的 cube_to_base.py(背景差分)+plate_to_base.py(HSV蓝)——两脚本 --camera
+    fixed,fixed_1 本身就做【双相机平均+交叉校验+单路 fallback】。以子进程运行(同 lerobot env),写出
+    calib/{cube,plate}_xyz_*.json,再读本次刚写的最新文件(按 mtime,兼容 fixed 被挡→fixed_1 fallback)。
+    必须在 robot.connect() 【之前】调用(脚本要独占相机;此时机器人尚未占用,不动机械臂)。
+    """
+    import glob
+    import os
+    import subprocess
+    import time as _time
+
+    out = {}
+    for script, key, prefix in (("cube_to_base.py", "cube_xyz", "cube_xyz"),
+                                ("plate_to_base.py", "plate_xyz", "plate_xyz")):
+        t0 = _time.time()
+        print(f"[detect] {script} --camera {cameras} …")
+        r = subprocess.run([sys.executable, os.path.join(SO101_SCRIPTS_DIR, script), "--camera", cameras],
+                           cwd=SO101_SCRIPTS_DIR, capture_output=True, text=True)
+        for ln in r.stdout.splitlines():
+            if any(s in ln for s in ("xyz", "🎯", "校验", "面积", "源=")):
+                print("   " + ln)
+        if r.returncode != 0:
+            hint = ""
+            if "无背景图" in (r.stdout + r.stderr):
+                hint = ("\n  → cube 背景图缺失。先在【空桌(无方块)、机械臂处于起始姿态】时跑一次:\n"
+                        f"    {sys.executable} {SO101_SCRIPTS_DIR}/cube_to_base.py --camera {cameras} --set-bg")
+            raise SystemExit(f"❌ {script} 检测失败:\n{r.stdout}\n{r.stderr}{hint}")
+        cands = [f for f in glob.glob(os.path.join(SO101_CALIB_DIR, f"{prefix}_*.json"))
+                 if os.path.getmtime(f) >= t0 - 1.0]
+        if not cands:
+            raise SystemExit(f"❌ {script} 未写出新的 {prefix}_*.json(检测可能没成功)")
+        newest = max(cands, key=os.path.getmtime)
+        out[key] = [float(v) for v in read_json(newest)[key]]
+    return out
+
+
+# ===========================================================================
+# Live trajectory visualization (optional, --viz-traj). Reproject the policy's
+# planned EE trajectory (abs_ee, base frame) onto the fixed camera frame and push
+# to rerun, mirroring the @csgbwk orange-trajectory overlay. PURELY ADDITIVE:
+# everything is gated behind args.viz_traj so the control path is byte-identical
+# when off. Math is the SAME as scripts/viz_ee_traj_poc.py / draw_base_frame.py.
+# ===========================================================================
+def load_proj_ctx(extrinsics_file: str) -> dict:
+    """Load calibrated [K|R|t|dist] for base-frame 3D -> fixed-camera pixel projection."""
+    import cv2
+
+    E = np.load(extrinsics_file)
+    rvec, _ = cv2.Rodrigues(E["R"])
+    return {"rvec": rvec, "tvec": E["t"].reshape(3, 1), "K": E["K"], "dist": E["dist"]}
+
+
+def _project(proj: dict, pts3d: np.ndarray) -> np.ndarray:
+    import cv2
+
+    p2, _ = cv2.projectPoints(np.asarray(pts3d, np.float64),
+                              proj["rvec"], proj["tvec"], proj["K"], proj["dist"])
+    return p2.reshape(-1, 2).astype(np.int32)
+
+
+def overlay_ee_traj(frame_rgb: np.ndarray, ee_xyz_base: np.ndarray, proj: dict,
+                    targets: dict | None = None, ee_xyz_bc: np.ndarray | None = None,
+                    ee_now: np.ndarray | None = None, downsample: int = 1) -> np.ndarray:
+    """Draw the planned EE trajectory (orange) on a COPY of frame_rgb. Optionally overlay a second
+    BC (un-steered) trajectory in gray (steering effect) and a live current-EE marker (magenta).
+
+    frame_rgb  : (H,W,3) uint8 RGB — ALREADY-PROCESSED fixed frame (ROTATE_270+crop_top=135, 505x480).
+    ee_xyz_base: (N,3) meters base — the EXECUTED (VLS-steered if guiding) trajectory → orange.
+    ee_xyz_bc  : optional (N,3) meters base — the un-steered BC trajectory → gray. The gap = steering.
+    ee_now     : optional (3,) meters base — the arm's CURRENT EE → magenta dot (real-time position).
+    downsample : >1 shrinks the returned image by that factor (less data → smoother rerun rendering).
+    """
+    import cv2
+
+    img = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR).copy()
+    # BC baseline (un-steered) first, dim gray, so the orange VLS line draws on top.
+    if ee_xyz_bc is not None:
+        pb = _project(proj, ee_xyz_bc)
+        cv2.polylines(img, [pb], False, (150, 150, 150), 2, cv2.LINE_AA)  # gray BGR
+        cv2.circle(img, tuple(pb[-1]), 4, (150, 150, 150), -1, cv2.LINE_AA)
+    pts = _project(proj, ee_xyz_base)
+    cv2.polylines(img, [pts], False, (0, 165, 255), 2, cv2.LINE_AA)  # orange BGR (executed/VLS)
+    for k, (u, v) in enumerate(pts):
+        cv2.circle(img, (int(u), int(v)), 2 if k else 5, (0, 165, 255), -1, cv2.LINE_AA)
+    cv2.circle(img, tuple(pts[0]), 6, (0, 255, 0), 2, cv2.LINE_AA)  # green start (plan origin)
+    if ee_now is not None:  # live arm EE (magenta) — animates at frame rate even when the plan is fixed
+        pn = _project(proj, [ee_now])[0]
+        cv2.circle(img, tuple(pn), 6, (255, 0, 255), -1, cv2.LINE_AA)
+    if targets:
+        for key, label in (("cube_xyz", "cube"), ("plate_xyz", "plate")):
+            if key in targets:
+                pt = _project(proj, [targets[key]])[0]
+                cv2.circle(img, tuple(pt), 7, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(img, label, (pt[0] + 9, pt[1]), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    # steering magnitude: max per-step EE divergence (mm) between VLS and BC trajectories.
+    if ee_xyz_bc is not None:
+        n = min(len(ee_xyz_base), len(ee_xyz_bc))
+        dmm = float(np.max(np.linalg.norm(np.asarray(ee_xyz_base)[:n] - np.asarray(ee_xyz_bc)[:n], axis=1))) * 1e3
+        cv2.putText(img, f"VLS steer: max dev {dmm:5.1f}mm  (orange=VLS gray=BC magenta=now)", (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+    if downsample and downsample > 1:
+        img = cv2.resize(img, (img.shape[1] // downsample, img.shape[0] // downsample),
+                         interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+class VizPusher:
+    """Background-thread trajectory-overlay pusher — keeps viz OFF the control critical path.
+
+    The control loop just calls submit(frame, abs_ee) (non-blocking); a daemon thread does the
+    cv2 overlay + log_rerun_data. A maxsize-1 queue means if the pusher is still busy with the
+    previous frame, the new one REPLACES it (drop-stale) — so a slow rerun flush can never stall
+    or back up the robot loop. This fixes the earlier symptom where the synchronous ~727KB image
+    flush per re-infer inserted a pause between "reached" and "execute next chunk".
+    """
+
+    def __init__(self, proj, targets, viz_cam, init_fn, log_fn, compress=True, downsample=2):
+        import queue
+        import threading
+
+        self.proj, self.targets, self.viz_cam = proj, targets, viz_cam
+        self.init_fn, self.log_fn, self.compress, self.downsample = init_fn, log_fn, compress, downsample
+        self._q = queue.Queue(maxsize=1)
+        self._ok = False
+        self._stop = False
+        self._t = threading.Thread(target=self._run, name="viz-pusher", daemon=True)
+        self._t.start()
+
+    def submit(self, frame_rgb, abs_ee, abs_ee_bc=None, ee_now=None):
+        import queue
+
+        item = (frame_rgb, abs_ee, abs_ee_bc, ee_now)
+        try:
+            self._q.put_nowait(item)
+        except queue.Full:  # pusher still busy -> drop the stale frame, keep the newest
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._q.put_nowait(item)
+            except queue.Full:
+                pass
+
+    def _run(self):
+        # init_rerun (rr.spawn) runs HERE, inside the daemon thread — so a slow/blocking/colliding
+        # rerun viewer spawn can NEVER stall the robot control loop or swallow Ctrl-C. If it fails,
+        # viz silently disables itself and the control loop is completely unaffected.
+        try:
+            self.init_fn(session_name="so101_ee_traj")
+            self._ok = True
+        except Exception as e:  # noqa: BLE001
+            print(f"[viz] init_rerun failed ({e}); trajectory viz disabled (robot loop unaffected)")
+        while not self._stop:
+            frame_rgb, abs_ee, abs_ee_bc, ee_now = self._q.get()
+            if frame_rgb is None:
+                break
+            if not self._ok:
+                continue  # keep draining so submit() never blocks, but skip logging
+            try:
+                overlaid = overlay_ee_traj(frame_rgb, abs_ee, self.proj, self.targets,
+                                           ee_xyz_bc=abs_ee_bc, ee_now=ee_now, downsample=self.downsample)
+                self.log_fn(observation={f"images.{self.viz_cam}_traj": overlaid},
+                            compress_images=self.compress)
+            except Exception as e:  # noqa: BLE001 — viz must never break control
+                print(f"[viz] async overlay skipped: {e}")
+
+    def close(self):
+        self._stop = True
+        try:
+            self._q.put_nowait((None, None, None, None))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ===========================================================================
@@ -536,6 +729,9 @@ def main() -> int:
     ap.add_argument("--calibration-path", default=DEFAULT_CALIBRATION_PATH)
     ap.add_argument("--ee-scale", nargs=3, type=float, default=DEFAULT_EE_SCALE,
                     help="per-axis EE delta scale in meters — MUST match training")
+    ap.add_argument("--abs-ee", action="store_true",
+                    help="ABSOLUTE-EE model (pi05_star_so101_v4_ee_abs): action[:,:3]=绝对EE米,直接IK,无 "
+                         "cumsum/ee_scale(去锯齿)。default=EE-delta. 必须与 serve 的 config 匹配。")
     ap.add_argument("--ik-iters", type=int, default=DEFAULT_IK_ITERS)
     ap.add_argument("--gripper-threshold", type=float, default=DEFAULT_GRIPPER_THRESHOLD)
     ap.add_argument("--gripper-open-pos", type=float, default=DEFAULT_GRIPPER_OPEN_POS,
@@ -547,7 +743,40 @@ def main() -> int:
                     help="attach cube/plate base-frame xyz to obs for downstream geometric guidance (default off)")
     ap.add_argument("--cube-xyz-file", default=DEFAULT_CUBE_XYZ_FILE)
     ap.add_argument("--plate-xyz-file", default=DEFAULT_PLATE_XYZ_FILE)
+    # 几何引导目标:默认每次运行【自动检测】当前 cube/plate(双相机交叉验证),不必手动先跑脚本。
+    ap.add_argument("--no-auto-detect-targets", dest="auto_detect_targets", action="store_false",
+                    help="with --guide, skip live detection and use the static --cube/plate-xyz-file JSONs instead")
+    ap.set_defaults(auto_detect_targets=True)
+    ap.add_argument("--detect-cameras", default="fixed,fixed_1",
+                    help="cameras for live cube/plate detection (dual = cross-validated average + fallback)")
+    # Live trajectory visualization (OFF by default; purely additive — see overlay_ee_traj).
+    ap.add_argument("--viz-traj", action="store_true",
+                    help="reproject the planned EE trajectory (abs_ee) onto the fixed frame and push "
+                         "to rerun each re-infer (orange polyline, @csgbwk-style). Zero effect on control.")
+    ap.add_argument("--viz-cam", default="fixed", choices=["fixed", "fixed_1"],
+                    help="which FIXED camera to overlay on (wrist excluded — its extrinsics aren't fixed)")
+    ap.add_argument("--viz-extrinsics", default=DEFAULT_EXTRINSICS_FILE,
+                    help="npz with calibrated K/R/t/dist for --viz-cam (base 3D -> pixel)")
+    # VLS 调参/诊断:per-request 覆盖 serve 的 guide_scale(不必重启 serve)。
+    ap.add_argument("--guide-scale", type=float, default=None,
+                    help="override server guide_scale per request (tune VLS strength live). None=server default.")
+    # 看 VLS 到底起没起作用:每步多跑一次【不引导(guide_scale=0)】推理做对照,叠加两条轨迹
+    # (橙=VLS执行的, 灰=BC不引导的) + 顶部显示最大散度(mm)。两线越分开=引导越强;重合=guide_scale 太小。
+    ap.add_argument("--viz-steering", action="store_true",
+                    help="overlay BC(un-steered) vs VLS(steered) EE trajectories to SEE the steering effect "
+                         "(implies --viz-traj; runs one extra guide_scale=0 infer, throttled by --viz-steering-every)")
+    # 实时显示:把画面刷新从【每次重规划(~1Hz)】解耦成【执行循环里每隔几步抓新帧】→ 实时相机+末端位置。
+    ap.add_argument("--viz-stride", type=int, default=2,
+                    help="push a FRESH camera frame + live EE marker every N executed steps (1=every step). "
+                         "Decouples display smoothness from the (slow) re-infer rate. 0=only per re-infer.")
+    ap.add_argument("--viz-downsample", type=int, default=2,
+                    help="shrink the pushed overlay image by this factor (less data → smoother rerun)")
+    ap.add_argument("--viz-steering-every", type=int, default=1,
+                    help="recompute the BC(guide=0) comparison every N re-infers (reuse between). 1=clean "
+                         "noise-matched compare every re-infer; >1 cuts extra inference if arm cadence too slow")
     args = ap.parse_args()
+    if args.viz_steering:
+        args.viz_traj = True  # steering overlay requires the trajectory viz pipeline
 
     if args.self_check:
         return self_check(args)
@@ -558,7 +787,37 @@ def main() -> int:
     calibration = load_so101_calibration(args.calibration_path)
     kin = make_kinematics(args.urdf)
     ee_scale = np.asarray(args.ee_scale, dtype=np.float64)
-    guide_targets = load_guide_targets(args.cube_xyz_file, args.plate_xyz_file) if args.guide else None
+    # 几何引导目标(cube/plate base 系米)。默认【运行时自动检测】当前位置(双相机交叉验证)——每次方块
+    # 摆哪都自动更新,无需手动先跑脚本。在 robot.connect() 之前做(独占相机、不动机械臂),便于 GO 前核对。
+    guide_targets = None
+    if args.guide:
+        if args.auto_detect_targets:
+            print(f"[guide] auto-detecting cube/plate (cameras={args.detect_cameras}) …")
+            guide_targets = autodetect_targets(args.detect_cameras)
+        else:
+            guide_targets = load_guide_targets(args.cube_xyz_file, args.plate_xyz_file)
+        print(f"[guide] cube_xyz={[round(v, 3) for v in guide_targets['cube_xyz']]}  "
+              f"plate_xyz={[round(v, 3) for v in guide_targets['plate_xyz']]}")
+
+    # Live trajectory viz (optional). Runs on a BACKGROUND thread (VizPusher) so it never
+    # delays inference or action execution. Loaded once; per-step submit is in the loop below.
+    viz_pusher = None
+    if args.viz_traj:
+        proj_ctx = load_proj_ctx(args.viz_extrinsics)
+        # green cube/plate keypoints: reuse the just-detected guide_targets if available, else static JSON.
+        viz_targets = guide_targets
+        if viz_targets is None:
+            try:
+                viz_targets = load_guide_targets(args.cube_xyz_file, args.plate_xyz_file)
+            except Exception as e:  # noqa: BLE001
+                print(f"[viz] cube/plate keypoints unavailable ({e}); drawing trajectory only")
+        from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+        # NOTE: init_rerun (rr.spawn) is NOT called here — it runs inside the VizPusher thread so a
+        # blocking/colliding rerun viewer can never hang startup or the robot loop (see VizPusher).
+        viz_pusher = VizPusher(proj_ctx, viz_targets, args.viz_cam, init_rerun, log_rerun_data,
+                               compress=True, downsample=max(1, args.viz_downsample))
+        print(f"[viz] live EE-trajectory overlay ON (async thread; rerun init in background) — "
+              f"cam={args.viz_cam}, extrinsics={args.viz_extrinsics}")
 
     robot = build_robot(args.robot_port, args.robot_id, args.max_relative_target, third_cam=third_cam)
 
@@ -587,6 +846,9 @@ def main() -> int:
     period = 1.0 / args.fps
     exec_h = max(1, args.exec_horizon)
     step = 0
+    reinfer_count = 0
+    last_bc_cumdelta = None   # cumsum(Δ_BC) from the most recent BC infer (re-anchored to current start)
+    last_bc_abs = None        # 绝对版: 最近一次 BC 推理的绝对 EE (abs 模式直接用)
     try:
         while step < args.max_steps:
             robot_obs = robot.get_observation()
@@ -595,6 +857,12 @@ def main() -> int:
             start_ee = fk(kin, joints6, calibration)[:3, 3]
             obs = build_openpi_obs(robot_obs, args.prompt, args.adv_ind, kin, calibration,
                                    third_cam=third_cam, guide_targets=guide_targets)
+            if args.guide_scale is not None:
+                obs["guide_scale"] = float(args.guide_scale)   # per-request override of serve default
+            if args.viz_steering:
+                # fix the flow-matching noise so the BC(guide=0) vs VLS overlay differs ONLY by steering
+                # (else ~cm sampling noise dominates and the steering effect is invisible).
+                obs["noise_seed"] = int(step) + 1
             t0 = time.perf_counter()
             result = client.infer(obs)
             chunk = np.asarray(result["actions"])  # (H, 10) = [pos_delta3, target_rot6d, gripper]
@@ -603,20 +871,56 @@ def main() -> int:
                 chunk, start_ee, joints6, kin, calibration, ee_scale,
                 ik_iters=args.ik_iters, gripper_threshold=args.gripper_threshold,
                 gripper_open_pos=args.gripper_open_pos, gripper_closed_pos=args.gripper_closed_pos,
+                absolute=args.abs_ee,
             )
+            # Steering-effect overlay: extra UN-steered (guide_scale=0, SAME noise_seed) infer → BC traj.
+            # Throttled by --viz-steering-every; absolute=chunk[:,:3] 直接; delta=cumsum(Δ) re-anchor 到 start_ee。
+            abs_ee_bc = None
+            if args.viz_steering and guide_targets is not None:
+                if reinfer_count % max(1, args.viz_steering_every) == 0:
+                    obs_bc = dict(obs)
+                    obs_bc["guide_scale"] = 0.0   # noise_seed inherited from obs → noise-matched compare
+                    chunk_bc = np.asarray(client.infer(obs_bc)["actions"])
+                    if args.abs_ee:
+                        last_bc_abs = chunk_bc[:, :3].copy()
+                    else:
+                        last_bc_abs = None
+                        last_bc_cumdelta = np.cumsum(np.clip(chunk_bc[:, :3], -0.999, 0.999) * ee_scale, axis=0)
+                if args.abs_ee:
+                    abs_ee_bc = last_bc_abs
+                elif last_bc_cumdelta is not None:
+                    abs_ee_bc = start_ee[None, :] + last_bc_cumdelta
+            reinfer_count += 1
             n = min(exec_h, len(commands), args.max_steps - step)
+            dev = "" if abs_ee_bc is None else f" | VLS-dev={np.max(np.linalg.norm(abs_ee[:len(abs_ee_bc)]-abs_ee_bc,axis=1))*1e3:.1f}mm"
             print(f"[step {step:4d}] infer={infer_ms:6.1f}ms chunk={chunk.shape} exec {n} steps "
-                  f"| state0={np.round(obs['observation/state'], 3)} | abs_ee[-1]={np.round(abs_ee[-1],4)}")
+                  f"| state0={np.round(obs['observation/state'], 3)} | abs_ee[-1]={np.round(abs_ee[-1],4)}{dev}")
+            # Immediate plan push (so the new orange/gray plan shows at once). When --viz-stride<=0 this
+            # is the ONLY push (per re-infer ≈1Hz). When >0, the exec loop below refreshes at frame rate.
+            if viz_pusher is not None and args.viz_stride <= 0:
+                viz_pusher.submit(np.array(robot_obs[args.viz_cam]), abs_ee, abs_ee_bc, start_ee)
             for h in range(n):
                 tick = time.perf_counter()
                 robot.send_action(commands[h])
                 step += 1
+                # REAL-TIME display: grab a fresh camera frame + live EE marker every --viz-stride steps,
+                # overlaying the (fixed-this-chunk) planned trajectories. Decouples display smoothness from
+                # the slow re-infer rate. Async (drop-stale) → never stalls control.
+                if viz_pusher is not None and args.viz_stride > 0 and (h % args.viz_stride == 0):
+                    try:
+                        ro = robot.get_observation()
+                        ee_now = fk(kin, joints_from_obs(ro), calibration)[:3, 3]
+                        viz_pusher.submit(np.array(ro[args.viz_cam]), abs_ee, abs_ee_bc, ee_now)
+                    except Exception:  # noqa: BLE001 — viz must never break control
+                        pass
                 dt = time.perf_counter() - tick
                 if period > dt:
                     time.sleep(period - dt)
     except KeyboardInterrupt:
         print("\n[client] interrupted by user (Ctrl-C)")
     finally:
+        if viz_pusher is not None:
+            viz_pusher.close()
         print("[robot] disconnecting ...")
         try:
             robot.disconnect()

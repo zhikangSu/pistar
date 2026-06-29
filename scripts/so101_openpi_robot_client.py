@@ -215,6 +215,12 @@ def main() -> int:
     ap.add_argument("--no-third-cam", action="store_true",
                     help="omit the 3rd camera (fixed_1 -> right_wrist_image); use for 2-camera "
                          "models like pi05_star_so101_demoA/recap. Default sends 3 cameras (3cam models).")
+    # 轨迹可视化:关节版预测的是关节角 → FK 算 EE 轨迹 → 反投影叠加(复用 EE 客户端的叠加机制)。
+    ap.add_argument("--viz-traj", action="store_true",
+                    help="reproject planned EE trajectory (=FK of predicted joints) onto fixed frame → rerun")
+    ap.add_argument("--viz-cam", default="fixed", choices=["fixed", "fixed_1"])
+    ap.add_argument("--viz-stride", type=int, default=2, help="每 N 步抓新帧刷新(实时);0=只每次重规划")
+    ap.add_argument("--viz-downsample", type=int, default=2)
     args = ap.parse_args()
 
     if args.self_check:
@@ -244,6 +250,27 @@ def main() -> int:
     client = WebsocketClientPolicy(host=args.server_host, port=args.port)
     print(f"[client] server metadata: {client.get_server_metadata()}")
 
+    # 轨迹可视化(可选):复用 EE 客户端 so101_openpi_robot_client_orient 的叠加机制 + FK。
+    # 关节版预测关节角 → FK(RANGE_M100_100→度→gripper_frame_link) → EE 轨迹 → 反投影叠加。
+    viz_pusher = viz_kin = viz_calib = fk_ee = None
+    if args.viz_traj:
+        import os as _os
+        sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import so101_openpi_robot_client_orient as O
+        proj_ctx = O.load_proj_ctx(f"/home/meow/SO101/calib/camera_extrinsics_{args.viz_cam}.npz")
+        viz_calib = O.load_so101_calibration(O.DEFAULT_CALIBRATION_PATH)
+        viz_kin = O.make_kinematics(O.DEFAULT_URDF)
+        fk_ee = lambda k, q, c: O.fk(k, q, c)[:3, 3]  # noqa: E731 (RANGE_M100_100 joints → EE xyz 米)
+        viz_targets = None
+        try:
+            viz_targets = O.load_guide_targets(O.DEFAULT_CUBE_XYZ_FILE, O.DEFAULT_PLATE_XYZ_FILE)
+        except Exception:  # noqa: BLE001
+            pass
+        from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+        viz_pusher = O.VizPusher(proj_ctx, viz_targets, args.viz_cam, init_rerun, log_rerun_data,
+                                 compress=True, downsample=max(1, args.viz_downsample))
+        print(f"[viz] joint-policy EE-trajectory overlay ON (FK of predicted joints) — cam={args.viz_cam}")
+
     print("[robot] connecting ...")
     robot.connect()
     period = 1.0 / args.fps
@@ -260,16 +287,35 @@ def main() -> int:
             n = min(exec_h, chunk.shape[0], args.max_steps - step)
             print(f"[step {step:4d}] infer={infer_ms:6.1f}ms chunk={chunk.shape} exec {n} steps "
                   f"| state0={np.round(obs['observation/state'], 1)}")
+            # viz: FK 预测关节 chunk[:,:6] → 规划 EE 轨迹(base 系米)
+            abs_ee_j = None
+            if viz_pusher is not None:
+                try:
+                    jt = np.asarray(chunk[:, :6], dtype=np.float64)
+                    abs_ee_j = np.array([fk_ee(viz_kin, jt[h], viz_calib) for h in range(min(n, len(jt)))])
+                except Exception:  # noqa: BLE001
+                    abs_ee_j = None
             for h in range(n):
                 tick = time.perf_counter()
                 robot.send_action(actions_to_joint_command(chunk[h]))
                 step += 1
+                # 实时叠加:每 viz_stride 步抓新帧 + 当前关节 FK 的实时末端
+                if viz_pusher is not None and abs_ee_j is not None and args.viz_stride > 0 and (h % args.viz_stride == 0):
+                    try:
+                        ro = robot.get_observation()
+                        jn = np.array([float(ro[f"{j}.pos"]) for j in JOINT_ORDER], np.float64)
+                        ee_now = fk_ee(viz_kin, jn, viz_calib)
+                        viz_pusher.submit(np.array(ro[args.viz_cam]), abs_ee_j, None, ee_now)
+                    except Exception:  # noqa: BLE001
+                        pass
                 dt = time.perf_counter() - tick
                 if period > dt:
                     time.sleep(period - dt)
     except KeyboardInterrupt:
         print("\n[client] interrupted by user (Ctrl-C)")
     finally:
+        if viz_pusher is not None:
+            viz_pusher.close()
         print("[robot] disconnecting ...")
         try:
             robot.disconnect()

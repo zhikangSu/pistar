@@ -240,6 +240,12 @@ class Pi0(_model.BaseModel):
         plate_xyz=None,          # (b,3) jnp，plate 在 base 系坐标（米）
         guide_scale: float = 0.0,  # 引导强度，0.0=不引导（默认，零回归）
         start_ratio: float = 0.6,  # 仅在 time<=start_ratio 的去噪后段注入引导
+        # ---- 反归一化常量：去噪在【分位数归一化空间】([q01,q99]->[-1,1])，reward 需 base 系【米】----
+        # raw=(xn+1)/2*(q99-q01)+q01；位置 delta 还要 ×ee_scale 得米（同 client）。缺省 None=不引导。
+        state_q01=None, state_q99=None,   # (b,Sdim) state 分位数；取 [6:9]=ee_xyz
+        act_q01=None, act_q99=None,       # (b,Adim) action 分位数；取 [:3]=pos, [9]=gripper
+        ee_scale=None,                    # (3,) 每轴 EE delta 米尺度（仅 delta 模式用）
+        absolute_ee: bool = False,        # True=绝对EE模型(action[:3]反归一化即绝对米,traj 直接=它,不 start_ee+cumsum)
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -290,12 +296,25 @@ class Pi0(_model.BaseModel):
             # ---- 几何 reward 去噪引导（EE-delta 部署专用，零回归）----
             # reward_fn / guide_scale 是闭包捕获的【静态 Python 对象/常量】(非 tracer)，可用 Python if。
             # 缺省 reward_fn=None + guide_scale=0.0 → if 短路不进，代码路径与原 :282-284 逐字节相同。
-            if reward_fn is not None and guide_scale:
+            # 还要求 cube_xyz/plate_xyz 都在(都是闭包静态值):serve 即使 guide_scale>0,client 不带
+            # --guide 时 cube/plate 缺省=None → 跳过引导=纯 BC,不崩。带 --guide 才注入坐标→引导。
+            if reward_fn is not None and guide_scale and cube_xyz is not None and plate_xyz is not None:
+                # 分位数反归一化到原始单位：raw = (xn+1)/2*(q99-q01)+q01。
+                def _denorm(xn, q01, q99):
+                    return (xn + 1.0) * 0.5 * (q99 - q01 + 1e-6) + q01
+
                 def reward_of_x(x):
-                    a = x[:, :, :4]                               # x_t pad 到 32 维，只取前 4=[dx,dy,dz,grip]
-                    start_ee = observation.state[:, 6:9]          # state9 的 ee_xyz (b,3)
-                    traj = start_ee[:, None, :] + jnp.cumsum(a[..., :3], axis=1)
-                    return reward_fn(cube_xyz, plate_xyz, traj, a[..., 3])
+                    # action10 布局: [pos(3), 目标朝向6D, gripper]。x_t 在分位数归一化空间 → 反归一化回【米】。
+                    pos_raw = _denorm(x[:, :, :3], act_q01[:, None, :3], act_q99[:, None, :3])  # (b,H,3)
+                    grip = _denorm(x[:, :, 9], act_q01[:, 9], act_q99[:, 9])   # (b,H) 夹爪(~0/1)
+                    if absolute_ee:
+                        # 绝对EE模型: action[:3] 反归一化即绝对 base 系米 → traj 直接=它(无 start_ee/cumsum/ee_scale)。
+                        traj = pos_raw
+                    else:
+                        # EE-delta 模型: pos 是 delta/ee_scale → ×ee_scale 得米增量,再 start_ee + cumsum。
+                        ee_m = _denorm(observation.state[:, 6:9], state_q01[:, 6:9], state_q99[:, 6:9])
+                        traj = ee_m[:, None, :] + jnp.cumsum(pos_raw * ee_scale[None, None, :], axis=1)
+                    return reward_fn(cube_xyz, plate_xyz, traj, grip)
 
                 g = jax.grad(reward_of_x)(x_t)
                 sc = guide_scale * jax.nn.sigmoid(12.0 * (start_ratio - time))

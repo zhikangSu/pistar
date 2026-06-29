@@ -19,6 +19,9 @@ CKPT="${CKPT:-/data/users/szk/pistar/checkpoints/pi05_star_so101/so101_lora_v1/1
 CONFIG="${CONFIG:-pi05_star_so101_infer}"
 PORT="${PORT:-8000}"
 GPU="${GPU:-${CUDA_VISIBLE_DEVICES:-0}}"
+# 几何引导(VLS): GUIDE_SCALE=0(默认)零回归; >0 启用 ee_steer 引导(需 EE-pose ckpt + client --guide)。
+GUIDE_SCALE="${GUIDE_SCALE:-0}"
+START_RATIO="${START_RATIO:-0.6}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -54,9 +57,18 @@ echo "    client : python scripts/so101_openpi_robot_client.py --server-host <th
 echo "════════════════════════════════════════════════════════════════"
 
 cd "$REPO_DIR"
+# 仅当 GUIDE_SCALE>0 才注入顶层引导参数(在 policy:checkpoint 子命令之前)；否则零回归。
+# ABS_EE=1 → 绝对EE模型(ee_abs config)开 VLS 时 reward 用绝对位置(不 cumsum);EE-delta 模型保持 0。
+GUIDE_ARGS=()
+if [[ -n "$GUIDE_SCALE" && "$GUIDE_SCALE" != "0" && "$GUIDE_SCALE" != "0.0" ]]; then
+  GUIDE_ARGS+=(--guide-scale="$GUIDE_SCALE" --start-ratio="$START_RATIO")
+  [[ "${ABS_EE:-0}" == "1" ]] && GUIDE_ARGS+=(--absolute-ee)
+  echo "    GEOMETRIC STEERING: guide_scale=$GUIDE_SCALE start_ratio=$START_RATIO absolute_ee=${ABS_EE:-0}"
+fi
 CUDA_VISIBLE_DEVICES="$GPU" XLA_PYTHON_CLIENT_PREALLOCATE=false \
   "$REPO_DIR/.venv/bin/python" scripts/serve_policy.py \
     --port="$PORT" \
+    ${GUIDE_ARGS[@]+"${GUIDE_ARGS[@]}"} \
     policy:checkpoint \
     --policy.config="$CONFIG" \
     --policy.dir="$CKPT"
