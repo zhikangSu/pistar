@@ -317,6 +317,10 @@ class Pi0(_model.BaseModel):
                     return reward_fn(cube_xyz, plate_xyz, traj, grip)
 
                 g = jax.grad(reward_of_x)(x_t)
+                # 梯度归一化到单位范数(同原版 VLS pi05_steer.py:394 grad/(‖grad‖+1e-8))。
+                # 关键:几何 reward 是米制小数→原始 ∂R/∂x 量级很小,不归一化 guide_scale 要硬调到 20-50;
+                # 归一化后 guide_scale 就是【动作空间步长】、可解释,原版用 ~80。
+                g = g / (jnp.linalg.norm(g) + 1e-8)
                 sc = guide_scale * jax.nn.sigmoid(12.0 * (start_ratio - time))
                 sc = jnp.where(time <= start_ratio, sc, 0.0)
                 # 符号：Euler 是 x_t + dt*v_t 且 dt<0；要 x_t 朝 +∇R（梯度上升），需 v_t -= sc*g。
