@@ -63,7 +63,9 @@ GUIDE_ARGS=()
 if [[ -n "$GUIDE_SCALE" && "$GUIDE_SCALE" != "0" && "$GUIDE_SCALE" != "0.0" ]]; then
   GUIDE_ARGS+=(--guide-scale="$GUIDE_SCALE" --start-ratio="$START_RATIO")
   [[ "${ABS_EE:-0}" == "1" ]] && GUIDE_ARGS+=(--absolute-ee)
-  echo "    GEOMETRIC STEERING: guide_scale=$GUIDE_SCALE start_ratio=$START_RATIO absolute_ee=${ABS_EE:-0}"
+  # JOINT_EE=1 → 关节绝对模型(pi05_star_so101_v4_3cam)开 VLS：reward 经可微 FK 算 EE。
+  [[ "${JOINT_EE:-0}" == "1" ]] && GUIDE_ARGS+=(--joint-ee)
+  echo "    GEOMETRIC STEERING: guide_scale=$GUIDE_SCALE start_ratio=$START_RATIO absolute_ee=${ABS_EE:-0} joint_ee=${JOINT_EE:-0}"
 fi
 CUDA_VISIBLE_DEVICES="$GPU" XLA_PYTHON_CLIENT_PREALLOCATE=false \
   "$REPO_DIR/.venv/bin/python" scripts/serve_policy.py \

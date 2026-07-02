@@ -66,7 +66,7 @@ class Policy(BasePolicy):
             # 缺省(reward_fn=None,guide_scale=0.0)时也安全：static None/0.0，if 短路、零回归。
             self._sample_actions = nnx_utils.module_jit(
                 model.sample_actions,
-                static_argnames=("reward_fn", "guide_scale", "start_ratio", "absolute_ee"),
+                static_argnames=("reward_fn", "guide_scale", "start_ratio", "absolute_ee", "joint_ee"),
             )
             self._rng = rng or jax.random.key(0)
 

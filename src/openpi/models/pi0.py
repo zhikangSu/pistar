@@ -9,11 +9,15 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models import so101_fk as _so101_fk
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
+
+# 关节版 VLS 用：可微 FK，对 (b,H,5) 弧度批量求 EE 位置 (b,H,3)。fk_pos 取单组 (5,)。
+_vmap_fk_pos = jax.vmap(jax.vmap(_so101_fk.fk_pos))
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -246,6 +250,8 @@ class Pi0(_model.BaseModel):
         act_q01=None, act_q99=None,       # (b,Adim) action 分位数；取 [:3]=pos, [9]=gripper
         ee_scale=None,                    # (3,) 每轴 EE delta 米尺度（仅 delta 模式用）
         absolute_ee: bool = False,        # True=绝对EE模型(action[:3]反归一化即绝对米,traj 直接=它,不 start_ee+cumsum)
+        joint_ee: bool = False,           # True=关节绝对模型(action[:5]反归一化=RANGE关节值,×joint_to_rad→弧度→可微FK→EE米)
+        joint_to_rad=None,                # (5,) RANGE→弧度的每关节比例(纯缩放)；仅 joint_ee 用
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -304,6 +310,16 @@ class Pi0(_model.BaseModel):
                     return (xn + 1.0) * 0.5 * (q99 - q01 + 1e-6) + q01
 
                 def reward_of_x(x):
+                    if joint_ee:
+                        # 关节绝对模型: action 布局 [5 转动关节(RANGE), gripper, ...padding]。
+                        # 反归一化→RANGE 关节值 → ×joint_to_rad 得弧度 → 可微 FK → EE 米。
+                        qr = _denorm(x[:, :, :5], act_q01[:, None, :5], act_q99[:, None, :5])  # (b,H,5) RANGE
+                        rad = qr * joint_to_rad[None, None, :]                                  # (b,H,5) 弧度
+                        traj = _vmap_fk_pos(rad)                                                # (b,H,3) base 系米
+                        # 夹爪取 [0,1] 归一化(=(xn+1)/2),与 EE 版 grip 语义一致(EE q01=0/q99=1 的 denorm 恰是它)。
+                        # 关节版夹爪 norm_stats 是 RANGE(q99≈38),若直接 denorm 会把 r_grip_close 项放大~38× 扭曲梯度。
+                        grip = (x[:, :, 5] + 1.0) * 0.5                                         # (b,H) 夹爪[0,1]
+                        return reward_fn(cube_xyz, plate_xyz, traj, grip)
                     # action10 布局: [pos(3), 目标朝向6D, gripper]。x_t 在分位数归一化空间 → 反归一化回【米】。
                     pos_raw = _denorm(x[:, :, :3], act_q01[:, None, :3], act_q99[:, None, :3])  # (b,H,3)
                     grip = _denorm(x[:, :, 9], act_q01[:, 9], act_q99[:, 9])   # (b,H) 夹爪(~0/1)

@@ -57,9 +57,11 @@ FIXED_CAM = {
 }
 WRIST_CAM = {
     "index_or_path": "/dev/v4l/by-id/usb-icSpring_icspring_camera-video-index0",
-    # MJPG (not YUYV): with 3 cameras sharing USB bandwidth, YUYV starves fixed_1. Matches
-    # record_pretty.py's 3-cam config so deploy images == training images.
-    "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG",
+    # 这台 wrist 相机(icSpring 无序列号那只, /dev/video2)【硬件只有 YUYV 640x480、根本没有 MJPG 模式】
+    # (v4l2-ctl --list-formats-ext 实测)。原来写 MJPG → 每次都 set 失败、回退 YUYV、刷一条 warning。
+    # 直接写 YUYV:像素完全一样(本来就是 YUYV),只是不再尝试不存在的格式、消掉 warning。
+    # 注:fixed(video0)/fixed_1(video4) 都支持 MJPG 且已正常走 MJPG,不受影响。
+    "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV",
 }
 # 3rd camera (fixed_1) -> observation/right_wrist_image. Only sent when --no-third-cam is NOT set.
 # Plain opencv 640x480 MJPG, identical to record_pretty.py CAMERAS["fixed_1"].
@@ -111,11 +113,15 @@ def build_robot(robot_port: str, robot_id: str, max_relative_target, third_cam: 
     return SO101Follower(config)
 
 
-def build_openpi_obs(robot_obs: dict, prompt: str, adv_ind: str, third_cam: bool = True) -> dict:
+def build_openpi_obs(robot_obs: dict, prompt: str, adv_ind: str, third_cam: bool = True,
+                     guide_targets: dict | None = None) -> dict:
     """Map lerobot observation -> openpi observation (same format as eval_so101_val_sanity.py).
 
     third_cam=True adds observation/right_wrist_image (fixed_1) for 3-camera models. The
     server's LiberoInputs uses it (mask=True) when present, else zero-pads + masks it off.
+
+    guide_targets (可选): {"cube_xyz":[x,y,z], "plate_xyz":[x,y,z]} base 系米；附进 obs 给 server
+    的关节版 VLS（reward 经可微 FK 用之）。serve 未开 JOINT_EE/guide 时这俩 key 无害忽略。
     """
     state = np.array([float(robot_obs[f"{j}.pos"]) for j in JOINT_ORDER], dtype=np.float32)
     obs = {
@@ -127,6 +133,9 @@ def build_openpi_obs(robot_obs: dict, prompt: str, adv_ind: str, third_cam: bool
     }
     if third_cam:
         obs["observation/right_wrist_image"] = np.asarray(robot_obs["fixed_1"])  # 480x640x3 uint8
+    if guide_targets is not None:
+        obs["cube_xyz"] = np.asarray(guide_targets["cube_xyz"], dtype=np.float32)
+        obs["plate_xyz"] = np.asarray(guide_targets["plate_xyz"], dtype=np.float32)
     return obs
 
 
@@ -221,6 +230,26 @@ def main() -> int:
     ap.add_argument("--viz-cam", default="fixed", choices=["fixed", "fixed_1"])
     ap.add_argument("--viz-stride", type=int, default=2, help="每 N 步抓新帧刷新(实时);0=只每次重规划")
     ap.add_argument("--viz-downsample", type=int, default=2)
+    # ---- VLS 几何引导(关节版)：serve 须 JOINT_EE=1 GUIDE_SCALE>0；这里附 cube/plate 坐标进 obs ----
+    ap.add_argument("--guide", action="store_true",
+                    help="启用关节版 VLS：自动检测当前 cube/plate(双相机交叉验证)并随 obs 发给 server。"
+                         "server 须 JOINT_EE=1 GUIDE_SCALE>0 起。")
+    ap.add_argument("--guide-from-files", action="store_true",
+                    help="with --guide：跳过实时检测，直接用静态 --cube/plate-xyz-file JSON。")
+    ap.add_argument("--guide-cameras", default="fixed,fixed_1",
+                    help="--guide 实时检测用的相机(逗号分隔，双相机交叉验证更稳)。")
+    ap.add_argument("--cube-xyz-file", default="/home/meow/SO101/calib/cube_xyz_fixed.json")
+    ap.add_argument("--plate-xyz-file", default="/home/meow/SO101/calib/plate_xyz_fixed.json")
+    ap.add_argument("--cube-xyz", default=None,
+                    help='手动 cube base 系坐标 "x,y,z"(米),跳过 CV 检测。用于解耦"检测对不对"和"VLS灵不灵"')
+    ap.add_argument("--plate-xyz", default=None, help='手动 plate base 系坐标 "x,y,z"(米),跳过检测')
+    ap.add_argument("--guide-scale", type=float, default=None,
+                    help="per-request 覆盖 serve 的 guide_scale(实时调 VLS 强度，不重启 serve)。None=用 serve 默认。")
+    ap.add_argument("--viz-steering", action="store_true",
+                    help="看 VLS 起没起作用:每步多跑一次不引导(guide_scale=0,同噪声)推理做对照，"
+                         "叠加 灰=BC vs 橙=VLS 两条 EE 轨迹 + 顶部 max-dev mm(隐含 --viz-traj，需 --guide)。")
+    ap.add_argument("--viz-steering-every", type=int, default=1,
+                    help="每 N 次重规划才跑一次 BC 对照(降低额外推理开销;默认每次)。")
     args = ap.parse_args()
 
     if args.self_check:
@@ -250,6 +279,36 @@ def main() -> int:
     client = WebsocketClientPolicy(host=args.server_host, port=args.port)
     print(f"[client] server metadata: {client.get_server_metadata()}")
 
+    args.viz_traj = args.viz_traj or args.viz_steering   # --viz-steering 隐含轨迹可视化
+
+    # ---- VLS 几何引导(关节版):载入 cube/plate base 系坐标 → 逐帧随 obs 发给 server ----
+    # server 须 JOINT_EE=1 GUIDE_SCALE>0 才真正引导;否则这俩 key 被无害忽略=纯 BC。
+    guide_targets = None
+    if args.guide or args.viz_steering:
+        import os as _os
+        sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import so101_openpi_robot_client_orient as O
+
+        def _xyz(s):
+            return [float(v) for v in s.split(",")] if s else None
+        man_cube, man_plate = _xyz(args.cube_xyz), _xyz(args.plate_xyz)
+        if man_cube is not None and man_plate is not None:
+            # 手动指定 cube/plate(米,base 系)→ 完全跳过 CV 检测。用于把【检测对不对】和【VLS灵不灵】解耦:
+            # 喂一个【你量准的】cube 坐标,单看 VLS 有没有把轨迹往它那拽。
+            guide_targets = {"cube_xyz": man_cube, "plate_xyz": man_plate}
+            print("[guide] 手动 cube/plate 坐标(跳过检测)")
+        elif args.guide_from_files:
+            guide_targets = O.load_guide_targets(args.cube_xyz_file, args.plate_xyz_file)
+        else:
+            guide_targets = O.autodetect_targets(args.guide_cameras)
+        # 手动只给了一个时,另一个仍用检测/文件补齐
+        if man_cube is not None and guide_targets is not None:
+            guide_targets["cube_xyz"] = man_cube
+        if man_plate is not None and guide_targets is not None:
+            guide_targets["plate_xyz"] = man_plate
+        print(f"[guide] cube_xyz={[round(v,3) for v in guide_targets['cube_xyz']]}  "
+              f"plate_xyz={[round(v,3) for v in guide_targets['plate_xyz']]}")
+
     # 轨迹可视化(可选):复用 EE 客户端 so101_openpi_robot_client_orient 的叠加机制 + FK。
     # 关节版预测关节角 → FK(RANGE_M100_100→度→gripper_frame_link) → EE 轨迹 → 反投影叠加。
     viz_pusher = viz_kin = viz_calib = fk_ee = None
@@ -261,11 +320,13 @@ def main() -> int:
         viz_calib = O.load_so101_calibration(O.DEFAULT_CALIBRATION_PATH)
         viz_kin = O.make_kinematics(O.DEFAULT_URDF)
         fk_ee = lambda k, q, c: O.fk(k, q, c)[:3, 3]  # noqa: E731 (RANGE_M100_100 joints → EE xyz 米)
-        viz_targets = None
-        try:
-            viz_targets = O.load_guide_targets(O.DEFAULT_CUBE_XYZ_FILE, O.DEFAULT_PLATE_XYZ_FILE)
-        except Exception:  # noqa: BLE001
-            pass
+        # 优先用刚检测/载入的 guide_targets 当 viz cube/plate 标记;否则退回静态文件。
+        viz_targets = guide_targets
+        if viz_targets is None:
+            try:
+                viz_targets = O.load_guide_targets(O.DEFAULT_CUBE_XYZ_FILE, O.DEFAULT_PLATE_XYZ_FILE)
+            except Exception:  # noqa: BLE001
+                pass
         from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
         viz_pusher = O.VizPusher(proj_ctx, viz_targets, args.viz_cam, init_rerun, log_rerun_data,
                                  compress=True, downsample=max(1, args.viz_downsample))
@@ -276,17 +337,22 @@ def main() -> int:
     period = 1.0 / args.fps
     exec_h = max(1, args.exec_horizon)
     step = 0
+    reinfer_count = 0
     try:
         while step < args.max_steps:
             robot_obs = robot.get_observation()
-            obs = build_openpi_obs(robot_obs, args.prompt, args.adv_ind, third_cam=third_cam)
+            obs = build_openpi_obs(robot_obs, args.prompt, args.adv_ind, third_cam=third_cam,
+                                   guide_targets=guide_targets)
+            if args.guide_scale is not None:
+                obs["guide_scale"] = float(args.guide_scale)   # per-request 覆盖 serve 默认
+            if args.viz_steering:
+                # 固定流匹配噪声,使 BC(guide=0) vs VLS 叠加只差在引导(否则采样噪声淹没引导效果)。
+                obs["noise_seed"] = int(step) + 1
             t0 = time.perf_counter()
             result = client.infer(obs)
             chunk = np.asarray(result["actions"])  # (H, 7)
             infer_ms = (time.perf_counter() - t0) * 1e3
             n = min(exec_h, chunk.shape[0], args.max_steps - step)
-            print(f"[step {step:4d}] infer={infer_ms:6.1f}ms chunk={chunk.shape} exec {n} steps "
-                  f"| state0={np.round(obs['observation/state'], 1)}")
             # viz: FK 预测关节 chunk[:,:6] → 规划 EE 轨迹(base 系米)
             abs_ee_j = None
             if viz_pusher is not None:
@@ -295,6 +361,30 @@ def main() -> int:
                     abs_ee_j = np.array([fk_ee(viz_kin, jt[h], viz_calib) for h in range(min(n, len(jt)))])
                 except Exception:  # noqa: BLE001
                     abs_ee_j = None
+            # Steering 对照:每 viz_steering_every 次重规划多跑一次 guide_scale=0(同噪声) → BC 轨迹。
+            abs_ee_bc = None
+            if args.viz_steering and guide_targets is not None and abs_ee_j is not None:
+                if reinfer_count % max(1, args.viz_steering_every) == 0:
+                    try:
+                        obs_bc = dict(obs); obs_bc["guide_scale"] = 0.0   # 噪声继承自 obs → 噪声匹配对照
+                        chunk_bc = np.asarray(client.infer(obs_bc)["actions"])
+                        jt_bc = np.asarray(chunk_bc[:, :6], dtype=np.float64)
+                        abs_ee_bc = np.array([fk_ee(viz_kin, jt_bc[h], viz_calib) for h in range(min(n, len(jt_bc)))])
+                    except Exception:  # noqa: BLE001
+                        abs_ee_bc = None
+            reinfer_count += 1
+            dev = "" if abs_ee_bc is None else (
+                f" | VLS-dev={np.max(np.linalg.norm(abs_ee_j[:len(abs_ee_bc)]-abs_ee_bc,axis=1))*1e3:.1f}mm")
+            print(f"[step {step:4d}] infer={infer_ms:6.1f}ms chunk={chunk.shape} exec {n} steps "
+                  f"| state0={np.round(obs['observation/state'], 1)}{dev}")
+            # viz_stride<=0:每次重规划立即推一次(橙=VLS/灰=BC 计划),否则下方按帧率刷新。
+            if viz_pusher is not None and abs_ee_j is not None and args.viz_stride <= 0:
+                try:
+                    jn0 = np.array([float(robot_obs[f"{j}.pos"]) for j in JOINT_ORDER], np.float64)
+                    viz_pusher.submit(np.array(robot_obs[args.viz_cam]), abs_ee_j, abs_ee_bc,
+                                      fk_ee(viz_kin, jn0, viz_calib))
+                except Exception:  # noqa: BLE001
+                    pass
             for h in range(n):
                 tick = time.perf_counter()
                 robot.send_action(actions_to_joint_command(chunk[h]))
@@ -305,7 +395,7 @@ def main() -> int:
                         ro = robot.get_observation()
                         jn = np.array([float(ro[f"{j}.pos"]) for j in JOINT_ORDER], np.float64)
                         ee_now = fk_ee(viz_kin, jn, viz_calib)
-                        viz_pusher.submit(np.array(ro[args.viz_cam]), abs_ee_j, None, ee_now)
+                        viz_pusher.submit(np.array(ro[args.viz_cam]), abs_ee_j, abs_ee_bc, ee_now)
                     except Exception:  # noqa: BLE001
                         pass
                 dt = time.perf_counter() - tick
