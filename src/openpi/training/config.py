@@ -1683,7 +1683,9 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_star_r5_lora4",
         project_name="pistar",
-        # 保底方案：与 pi05_star_r5 相同的 LoRA，但 FSDP 到 4 卡、batch 32（单卡版是 16）。推理复用 pi05_star_r5_infer。
+        # 4 卡 LoRA：与 pi05_star_r5 相同的 LoRA，batch 32，4 卡【数据并行】（fsdp_devices=1 + 4 张可见卡 → mesh (4,1)，
+        # 参数每卡复制、只同步 LoRA 梯度）。实测 fsdp_devices=4 在 PCIe 4090 上每步 all-gather 整个模型，4.2 s/it 反而慢 3 倍。
+        # 推理复用 pi05_star_r5_infer。
         model=pi0_config.Pi0Config(
             pi05=True,
             pistar=True,
@@ -1700,7 +1702,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        fsdp_devices=4,
+        fsdp_devices=1,  # 4 卡数据并行（见上）
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=1e-4,
