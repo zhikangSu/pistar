@@ -1614,6 +1614,116 @@ _CONFIGS = [
         num_train_steps=30_000,
         keep_period=5_000,
     ),
+    # ------------------------------------------------------------------
+    # R5 多卡版（GPU 4,5,6,7 空闲时）。三个配置共用同一 repo_id → norm stats 只需算一次。
+    #   pi05_star_r5_4gpu       全参数微调 + EMA，FSDP 4 卡，batch 32（首选；单卡 24G 装不下全参，4 卡切分后估计每卡 ~17-20G）
+    #   pi05_star_r5_4gpu_infer 上者的推理配置（serve_policy 用）
+    #   pi05_star_r5_lora4      LoRA + FSDP 4 卡 batch 32（全参 OOM 时的保底；推理用 pi05_star_r5_infer）
+    # 启动：CUDA_VISIBLE_DEVICES=4,5,6,7 XLA_PYTHON_CLIENT_MEM_FRACTION=0.92 python scripts/train.py pi05_star_r5_4gpu --exp-name=r5_full_v1 --overwrite
+    # ------------------------------------------------------------------
+    TrainConfig(
+        name="pi05_star_r5_4gpu",
+        project_name="pistar",
+        # 全参数（无 LoRA）：与 openpi 官方 pi05_libero 微调方式一致，靠 FSDP 把 ~3.4B 参数 + AdamW 状态切到 4 卡
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/r5_block_into_plate_v2_pistar",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            action_dim=7,
+        ),
+        batch_size=32,  # 4 卡 → 每卡 8；必须能被卡数整除
+        num_workers=8,
+        fsdp_devices=4,  # CUDA_VISIBLE_DEVICES=4,5,6,7
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_star_r5_4gpu_infer",
+        project_name="pistar",
+        # 全参数（无 LoRA）：与 openpi 官方 pi05_libero 微调方式一致，靠 FSDP 把 ~3.4B 参数 + AdamW 状态切到 4 卡
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/r5_block_into_plate_v2_pistar",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            action_dim=7,
+            adv_ind_dropout=False,  # disable adv_ind dropout during inference
+        ),
+        batch_size=32,  # 4 卡 → 每卡 8；必须能被卡数整除
+        num_workers=8,
+        fsdp_devices=4,  # CUDA_VISIBLE_DEVICES=4,5,6,7
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_star_r5_lora4",
+        project_name="pistar",
+        # 保底方案：与 pi05_star_r5 相同的 LoRA，但 FSDP 到 4 卡、batch 32（单卡版是 16）。推理复用 pi05_star_r5_infer。
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/r5_block_into_plate_v2_pistar",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            action_dim=7,
+        ),
+        batch_size=32,
+        num_workers=8,
+        fsdp_devices=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        keep_period=5_000,
+    ),
     # ---- RECAP round2 FROM-BASE retrain (paper-faithful, §V-D p.7: each round re-finetune from the
     # PRETRAINED ckpt rather than warm-starting from the previous round, to avoid multi-round drift).
     # Copy of pi05_star_so101; differs ONLY in data.repo_id (merged demo+round1+round2, advantage-
