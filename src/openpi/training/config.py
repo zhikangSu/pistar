@@ -1521,6 +1521,99 @@ _CONFIGS = [
         num_train_steps=30_000,
         keep_period=5_000,
     ),
+    # ------------------------------------------------------------------
+    # Pi05_star ARX R5（方舟 R5 单臂，7-DoF = 6 关节弧度 + 夹爪 0~5，2 相机 fixed/wrist）— LoRA，单卡 24GB。
+    # 与 pi05_star_so101 完全同构，差别：data.repo_id 指向 R5 数据集；action_dim=7（R5 正好是 LIBERO 的 7 维，
+    # LiberoOutputs 默认切 [:7] 即可，部署端不需要像 SO101 那样再切 [:6]）。
+    # 数据来源：~/R5/record_r5.py（HDF5）→ ~/R5/to_lerobot.py（LeRobot v3.0，meow/r5_block_into_plate_v2）
+    #          → scripts/convert_so101_v3_to_pistar.py --source <v3.0> --repo_name meow/r5_block_into_plate_v2_pistar
+    # 用法：python scripts/compute_norm_stats.py --config-name pi05_star_r5 && python scripts/train.py pi05_star_r5 --exp-name=r5_lora_v1
+    # ------------------------------------------------------------------
+    TrainConfig(
+        name="pi05_star_r5",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/r5_block_into_plate_v2_pistar",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,  # 绝对关节目标（主臂关节角），不做 delta
+            action_dim=7,  # R5: 6 关节 + 夹爪，LiberoOutputs 直接切 [:7]，部署端不用再改
+        ),
+        batch_size=16,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,  # LoRA: turn EMA off
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        keep_period=5_000,
+    ),
+    # Inference/serving counterpart: identical model, adv_ind dropout disabled.
+    TrainConfig(
+        name="pi05_star_r5_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="meow/r5_block_into_plate_v2_pistar",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,  # 绝对关节目标（主臂关节角），不做 delta
+            action_dim=7,  # R5: 6 关节 + 夹爪，LiberoOutputs 直接切 [:7]，部署端不用再改
+            adv_ind_dropout=False,  # disable adv_ind dropout during inference
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,  # LoRA: turn EMA off
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/szk/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            pistar=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        keep_period=5_000,
+    ),
     # ---- RECAP round2 FROM-BASE retrain (paper-faithful, §V-D p.7: each round re-finetune from the
     # PRETRAINED ckpt rather than warm-starting from the previous round, to avoid multi-round drift).
     # Copy of pi05_star_so101; differs ONLY in data.repo_id (merged demo+round1+round2, advantage-
